@@ -32,10 +32,14 @@ db.init_db()
 def get_auth_flow():
     # 优先尝试从 Streamlit Secrets 读取配置
     if "web" in st.secrets:
+        # 动态获取 redirect_uri: 优先从 secrets 读取, 否则默认 localhost
+        secrets_config = dict(st.secrets)
+        redirect_uri = secrets_config["web"].get("redirect_uris", ["http://localhost:8501"])[0]
+        
         return Flow.from_client_config(
-            client_config=dict(st.secrets),
+            client_config=secrets_config,
             scopes=SCOPES,
-            redirect_uri='http://localhost:8501'
+            redirect_uri=redirect_uri
         )
     
     # 回退到读取本地文件
