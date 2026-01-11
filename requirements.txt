@@ -3,3 +3,6 @@ hyperliquid-python-sdk
 pandas
 python-dotenv
 eth-account
+google-auth-oauthlib
+google-auth-httplib2
+requests

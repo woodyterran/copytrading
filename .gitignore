@@ -1,0 +1,23 @@
+# Environment variables (Sensitive data!)
+.env
+
+# Google OAuth Credentials (Sensitive!)
+client_secret.json
+
+# User database
+users.db
+
+# Logs and runtime files
+*.log
+*.pid
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Mac system files
+.DS_Store
+
+# User data (Optional)
+# *.csv
+# *.xlsx
