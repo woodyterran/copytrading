@@ -30,8 +30,15 @@ db.init_db()
 
 # --- Google Auth 辅助函数 ---
 def get_auth_flow():
-    # 注意: Redirect URI 必须与 Google Cloud Console 中配置的一致
-    # 本地开发通常是 http://localhost:8501
+    # 优先尝试从 Streamlit Secrets 读取配置
+    if "web" in st.secrets:
+        return Flow.from_client_config(
+            client_config=dict(st.secrets),
+            scopes=SCOPES,
+            redirect_uri='http://localhost:8501'
+        )
+    
+    # 回退到读取本地文件
     return Flow.from_client_secrets_file(
         CLIENT_SECRETS_FILE,
         scopes=SCOPES,
@@ -79,10 +86,13 @@ def get_bot_pid(pid_file):
 def login_page():
     st.title('🔐 登录')
     
-    # 检查 client_secret.json 是否存在
-    if not os.path.exists(CLIENT_SECRETS_FILE):
-        st.error("未找到 `client_secret.json` 配置文件。")
-        st.info("请前往 Google Cloud Console 下载 OAuth 2.0 客户端凭据 JSON 文件，并将其重命名为 `client_secret.json` 放置在项目根目录。")
+    # 检查配置是否存在 (优先检查 st.secrets, 其次检查文件)
+    has_secrets = "web" in st.secrets
+    has_file = os.path.exists(CLIENT_SECRETS_FILE)
+    
+    if not has_secrets and not has_file:
+        st.error("未找到 Google OAuth 配置。")
+        st.info("请配置 `.streamlit/secrets.toml` 或上传 `client_secret.json`。")
         return
 
     # 处理 OAuth 回调

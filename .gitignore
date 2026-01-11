@@ -3,6 +3,7 @@
 
 # Google OAuth Credentials (Sensitive!)
 client_secret.json
+.streamlit/secrets.toml
 
 # User database
 users.db
