@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import os
 import subprocess
@@ -138,7 +139,7 @@ if target_address:
                     
                     display_orders = df_orders[['time', 'coin', 'side', 'limitPx', 'sz']].sort_values('time', ascending=False).reset_index(drop=True)
                     display_orders.index = display_orders.index + 1
-                    st.dataframe(display_orders, use_container_width=True, height=1050)
+                    st.dataframe(display_orders, width='stretch', height=1050)
             else:
                 st.info("当前无挂单")
                 
@@ -161,7 +162,7 @@ if target_address:
             if pos_data:
                 df_pos = pd.DataFrame(pos_data)
                 df_pos.index = df_pos.index + 1
-                st.dataframe(df_pos, use_container_width=True, height=1050)
+                st.dataframe(df_pos, width='stretch', height=1050)
             else:
                 st.info("当前无持仓")
                 
@@ -177,7 +178,7 @@ if target_address:
                     
                     display_fills = df_fills[['time', 'coin', 'side', 'price', 'size', 'fee', 'closedPnl']].head(50)
                     display_fills.index = display_fills.index + 1
-                    st.dataframe(display_fills, use_container_width=True, height=1050)
+                    st.dataframe(display_fills, width='stretch', height=1050)
                 else:
                     st.info("暂无可见成交记录")
             except Exception as e:
