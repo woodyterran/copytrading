@@ -124,12 +124,6 @@ def login_page():
         auth_url, _ = flow.authorization_url(prompt='consent')
         st.link_button("👉 点击跳转 Google 登录", auth_url)
 
-    st.divider()
-    if st.button('🛠️ 本地测试免登录 (仅限本地开发)'):
-        st.session_state['user_email'] = 'test_user@localhost'
-        st.session_state['user_name'] = 'Test User'
-        st.rerun()
-
 # --- 主应用 ---
 def main_app(email):
     st.sidebar.success(f"已登录: {email}")
