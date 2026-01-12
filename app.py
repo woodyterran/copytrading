@@ -124,6 +124,12 @@ def login_page():
         auth_url, _ = flow.authorization_url(prompt='consent')
         st.link_button("👉 点击跳转 Google 登录", auth_url)
 
+    st.divider()
+    if st.button('🛠️ 本地测试免登录 (仅限本地开发)'):
+        st.session_state['user_email'] = 'test_user@localhost'
+        st.session_state['user_name'] = 'Test User'
+        st.rerun()
+
 # --- 主应用 ---
 def main_app(email):
     st.sidebar.success(f"已登录: {email}")
@@ -148,10 +154,20 @@ def main_app(email):
         copy_ratio = st.number_input('跟单比例', value=float(user_config.get('copy_ratio', 0.1)), min_value=0.01, step=0.01, format='%.2f')
         slippage = st.number_input('最大滑点', value=float(user_config.get('slippage', 0.02)), min_value=0.01, step=0.01)
         
+        sync_mode_options = {'full': '同步持仓 (Full Sync)', 'order': '仅同步下单 (Orders Only)'}
+        sync_mode_val = user_config.get('sync_mode', 'full')
+        sync_mode = st.radio(
+            '跟单模式',
+            options=list(sync_mode_options.keys()),
+            format_func=lambda x: sync_mode_options[x],
+            index=0 if sync_mode_val == 'full' else 1,
+            help="同步持仓: 初始时将仓位调整至目标一致。\n仅同步下单: 初始不调整仓位，仅跟随后续的挂单和市价单。"
+        )
+        
         submitted = st.form_submit_button('保存配置')
         
         if submitted:
-            db.save_user_config(email, private_key, target_address, copy_ratio, slippage)
+            db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode)
             st.sidebar.success('配置已保存！')
             # 重新加载以更新界面
             st.rerun()
@@ -190,6 +206,7 @@ def main_app(email):
                     env['TARGET_ADDRESS'] = cfg['target_address']
                     env['COPY_RATIO'] = str(cfg['copy_ratio'])
                     env['SLIPPAGE'] = str(cfg['slippage'])
+                    env['SYNC_MODE'] = str(cfg.get('sync_mode', 'full'))
                     
                     with open(LOG_FILE, 'a') as log_f:
                         proc = subprocess.Popen(
