@@ -14,9 +14,6 @@ import pytz
 from dotenv import load_dotenv
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
-from google_auth_oauthlib.flow import Flow
-from google.oauth2 import id_token
-from google.auth.transport import requests as google_requests
 import database as db
 
 from streamlit_autorefresh import st_autorefresh
@@ -27,8 +24,6 @@ st.set_page_config(page_title='Hyperliquid 跟单机器人', layout='wide')
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, '.env')
 SCRIPT_PATH = os.path.join(BASE_DIR, 'hyperliquid_copy_trader.py')
-CLIENT_SECRETS_FILE = os.path.join(BASE_DIR, 'client_secret.json')
-SCOPES = ['openid', 'https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile']
 
 # 初始化数据库
 db.init_db()
@@ -38,38 +33,6 @@ def get_cookie_manager():
     return stx.CookieManager()
 
 cookie_manager = get_cookie_manager()
-
-# --- Google Auth 辅助函数 ---
-def get_auth_flow():
-    # 优先尝试从 Streamlit Secrets 读取配置
-    if "web" in st.secrets:
-        # 动态获取 redirect_uri: 优先从 secrets 读取, 否则默认 localhost
-        secrets_config = dict(st.secrets)
-        redirect_uri = secrets_config["web"].get("redirect_uris", ["http://localhost:8501"])[0]
-        
-        return Flow.from_client_config(
-            client_config=secrets_config,
-            scopes=SCOPES,
-            redirect_uri=redirect_uri
-        )
-    
-    # 回退到读取本地文件
-    return Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri='http://localhost:8501' 
-    )
-
-def verify_google_token(token):
-    try:
-        id_info = id_token.verify_oauth2_token(
-            token, 
-            google_requests.Request(), 
-            audience=None  # 可以指定 Client ID 增加安全性
-        )
-        return id_info
-    except ValueError:
-        return None
 
 # --- 用户隔离辅助函数 ---
 def get_user_files(email):
@@ -97,132 +60,95 @@ def get_bot_pid(pid_file):
             return None
     return None
 
-# --- 登录页面 ---
-def login_page():
-    st.title('🔐 登录')
+DEFAULT_USER_EMAIL = "admin@remote"
+
+# --- 侧边栏逻辑 (登录/配置/控制) ---
+def sidebar_logic():
+    st.sidebar.title('🤖 Hyperliquid 跟单')
     
-    # 检查配置是否存在 (优先检查 st.secrets, 其次检查文件)
-    has_secrets = "web" in st.secrets
-    has_file = os.path.exists(CLIENT_SECRETS_FILE)
+    # 检查登录状态
+    is_logged_in = 'user_email' in st.session_state
     
-    if not has_secrets and not has_file:
-        st.error("未找到 Google OAuth 配置。")
-        st.info("请配置 `.streamlit/secrets.toml` 或上传 `client_secret.json`。")
-        return
-
-    # 处理 OAuth 回调
-    if 'code' in st.query_params:
-        try:
-            code = st.query_params['code']
-            flow = get_auth_flow()
-            flow.fetch_token(code=code)
-            credentials = flow.credentials
-            
-            # 验证 Token 获取用户信息
-            user_info = verify_google_token(credentials.id_token)
-            
-            if user_info:
-                # 设置 Cookie (有效期 30 天)
-                expires_at = datetime.now() + timedelta(days=30)
-                cookie_manager.set('user_email', user_info['email'], key="set_email", expires_at=expires_at)
-                st.session_state['user_email'] = user_info['email']
-                st.session_state['user_name'] = user_info.get('name', 'User')
-                # 清除 URL 参数
-                st.query_params.clear()
-                st.rerun()
-        except Exception as e:
-            st.error(f"登录失败: {e}")
+    if is_logged_in:
+        email = st.session_state['user_email']
+        st.sidebar.success(f"已登录: {email}")
         
-    if st.button('使用 Google 账号登录'):
-        flow = get_auth_flow()
-        auth_url, _ = flow.authorization_url(prompt='consent')
-        st.link_button("👉 点击跳转 Google 登录", auth_url)
-
-# --- 主应用 ---
-def main_app(email):
-    st.sidebar.success(f"已登录: {email}")
-    if st.sidebar.button("登出"):
-        cookie_manager.delete('user_email', key="del_email")
-        if 'user_email' in st.session_state:
-            del st.session_state['user_email']
-        st.rerun()
-
-    st.title('🤖 Hyperliquid 跟单机器人控制台')
-
-    # 获取用户文件路径
-    user_files = get_user_files(email)
-    PID_FILE = user_files['pid']
-    LOG_FILE = user_files['log']
-
-    # 加载用户配置
-    user_config = db.get_user_config(email) or {}
-    
-    st.sidebar.header('⚙️ 参数配置')
-    with st.sidebar.form('config_form'):
-        private_key = st.text_input('私钥 (MY_PRIVATE_KEY)', value=user_config.get('private_key', ''), type='password')
-        target_address = st.text_input('目标地址', value=user_config.get('target_address', '0xdAe4DF7207feB3B350e4284C8eFe5f7DAc37f637'))
-        copy_ratio = st.number_input('跟单比例', value=float(user_config.get('copy_ratio', 0.1)), min_value=0.01, step=0.01, format='%.2f')
-        slippage = st.number_input('最大滑点', value=float(user_config.get('slippage', 0.02)), min_value=0.01, step=0.01)
-        
-        sync_mode_options = {'full': '同步持仓 (Full Sync)', 'order': '仅同步下单 (Orders Only)'}
-        sync_mode_val = user_config.get('sync_mode', 'full')
-        sync_mode = st.radio(
-            '跟单模式',
-            options=list(sync_mode_options.keys()),
-            format_func=lambda x: sync_mode_options[x],
-            index=0 if sync_mode_val == 'full' else 1,
-            help="同步持仓: 初始时将仓位调整至目标一致。\n仅同步下单: 初始不调整仓位，仅跟随后续的挂单和市价单。"
-        )
-        
-        auto_refresh_interval = st.number_input('监控自动刷新间隔 (秒)', value=int(user_config.get('auto_refresh_interval', 10)), min_value=1, step=1, help="设置监控目标用户数据的自动刷新时间间隔")
-
-        submitted = st.form_submit_button('保存配置')
-        
-        if submitted:
-            db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval)
-            st.sidebar.success('配置已保存！')
-            # 重新加载以更新界面
+        # --- 登出按钮 ---
+        if st.sidebar.button("登出"):
+            try:
+                cookie_manager.delete('user_email', key="del_email")
+            except KeyError:
+                pass # Cookie already deleted or not found
+                
+            if 'user_email' in st.session_state:
+                del st.session_state['user_email']
             st.rerun()
+            
+        st.sidebar.divider()
+        st.sidebar.header('⚙️ 参数配置')
+        
+        # 加载用户配置
+        user_config = db.get_user_config(email) or {}
+        
+        with st.sidebar.form('config_form'):
+            private_key = st.text_input('私钥 (MY_PRIVATE_KEY)', value=user_config.get('private_key', ''), type='password')
+            target_address = st.text_input('目标地址', value=user_config.get('target_address', '0xdAe4DF7207feB3B350e4284C8eFe5f7DAc37f637'))
+            copy_ratio = st.number_input('跟单比例', value=float(user_config.get('copy_ratio', 0.1)), min_value=0.01, step=0.01, format='%.2f')
+            slippage = st.number_input('最大滑点', value=float(user_config.get('slippage', 0.02)), min_value=0.01, step=0.01)
+            
+            sync_mode_options = {'full': '同步持仓 (Full Sync)', 'order': '仅同步下单 (Orders Only)'}
+            sync_mode_val = user_config.get('sync_mode', 'full')
+            sync_mode = st.radio(
+                '跟单模式',
+                options=list(sync_mode_options.keys()),
+                format_func=lambda x: sync_mode_options[x],
+                index=0 if sync_mode_val == 'full' else 1,
+                help="同步持仓: 初始时将仓位调整至目标一致。\n仅同步下单: 初始不调整仓位，仅跟随后续的挂单和市价单。"
+            )
+            
+            auto_refresh_interval = st.number_input('监控自动刷新间隔 (秒)', value=int(user_config.get('auto_refresh_interval', 10)), min_value=1, step=1, help="设置监控目标用户数据的自动刷新时间间隔")
 
-    # 如果没有配置，提示先配置
-    current_target = user_config.get('target_address')
-    
-    # --- 自动刷新 ---
-    refresh_interval = user_config.get('auto_refresh_interval', 10)
-    st_autorefresh(interval=refresh_interval * 1000, key="data_refresh")
+            submitted = st.form_submit_button('保存配置')
+            
+            if submitted:
+                db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval)
+                st.sidebar.success('配置已保存！')
+                st.rerun()
 
-    # --- 机器人控制 ---
-    pid = get_bot_pid(PID_FILE)
-    is_running = pid is not None
-    
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.subheader('状态控制')
+        st.sidebar.divider()
+        st.sidebar.subheader('状态控制')
+        
+        # 获取机器人状态
+        user_files = get_user_files(email)
+        PID_FILE = user_files['pid']
+        LOG_FILE = user_files['log']
+        
+        pid = get_bot_pid(PID_FILE)
+        is_running = pid is not None
+        
         if is_running:
-            st.success(f'🟢 运行中 (PID: {pid})')
-            if st.button('🔴 停止机器人'):
+            st.sidebar.success(f'🟢 运行中 (PID: {pid})')
+            if st.sidebar.button('🔴 停止机器人'):
                 try:
                     os.kill(pid, signal.SIGTERM)
                     if os.path.exists(PID_FILE): os.remove(PID_FILE)
                     st.rerun()
                 except Exception as e:
-                    st.error(f'停止失败: {e}')
+                    st.sidebar.error(f'停止失败: {e}')
         else:
-            st.warning('⚪ 已停止')
-            if st.button('🟢 启动机器人'):
-                # 获取最新配置用于启动进程
+            st.sidebar.warning('⚪ 已停止')
+            if st.sidebar.button('🟢 启动机器人'):
                 cfg = db.get_user_config(email)
                 if not cfg or not cfg.get('private_key'):
-                    st.error("请先保存配置（特别是私钥）再启动机器人")
+                    st.sidebar.error("请先保存配置（特别是私钥）")
                 else:
-                    # 准备环境变量
                     env = os.environ.copy()
                     env['MY_PRIVATE_KEY'] = cfg['private_key']
                     env['TARGET_ADDRESS'] = cfg['target_address']
                     env['COPY_RATIO'] = str(cfg['copy_ratio'])
                     env['SLIPPAGE'] = str(cfg['slippage'])
                     env['SYNC_MODE'] = str(cfg.get('sync_mode', 'full'))
+                    env['AUTO_REFRESH_INTERVAL'] = str(cfg.get('auto_refresh_interval', 10))
                     
                     with open(LOG_FILE, 'a') as log_f:
                         proc = subprocess.Popen(
@@ -231,30 +157,101 @@ def main_app(email):
                         )
                     with open(PID_FILE, 'w') as f: f.write(str(proc.pid))
                     st.rerun()
+                    
+        # --- 修改密码 ---
+        with st.sidebar.expander("🔑 修改管理员密码"):
+            with st.form("change_pwd_form"):
+                old_pwd = st.text_input("原密码", type="password")
+                new_pwd = st.text_input("新密码", type="password")
+                confirm_pwd = st.text_input("确认新密码", type="password")
+                
+                if st.form_submit_button("修改密码"):
+                    current_db_pwd = db.get_admin_password()
+                    # 如果数据库没有密码（理论上登录时已同步），则使用默认逻辑
+                    actual_current_pwd = current_db_pwd if current_db_pwd else st.secrets.get("admin_password", "admin123")
+                    
+                    if old_pwd != actual_current_pwd:
+                        st.error("原密码错误")
+                    elif new_pwd != confirm_pwd:
+                        st.error("两次输入的新密码不一致")
+                    elif not new_pwd:
+                        st.error("新密码不能为空")
+                    else:
+                        db.set_admin_password(new_pwd)
+                        st.success("密码修改成功！请重新登录。")
+                        # 登出
+                        try:
+                            cookie_manager.delete('user_email', key="del_email_chpwd")
+                        except KeyError:
+                            pass # Cookie already deleted or not found
+                            
+                        if 'user_email' in st.session_state:
+                            del st.session_state['user_email']
+                        time.sleep(1)
+                        st.rerun()
+            
+    else:
+        # 未登录状态：显示登录表单
+        st.sidebar.info("登录后可修改配置和控制机器人")
+        with st.sidebar.form("login_form"):
+            st.markdown("### 🔐 管理员登录")
+            pwd = st.text_input("访问密码", type="password")
+            if st.form_submit_button("登录"):
+                # 优先从数据库获取密码，如果为空则使用 secrets 或默认值
+                db_pwd = db.get_admin_password()
+                correct_pwd = db_pwd if db_pwd else st.secrets.get("admin_password", "admin123")
+                
+                if pwd == correct_pwd:
+                    # 如果数据库中没有密码，自动同步当前使用的正确密码到数据库
+                    if not db_pwd:
+                        db.set_admin_password(correct_pwd)
+                        
+                    expires_at = datetime.now() + timedelta(days=30)
+                    user_email = DEFAULT_USER_EMAIL
+                    cookie_manager.set('user_email', user_email, key="set_pwd_email", expires_at=expires_at)
+                    st.session_state['user_email'] = user_email
+                    st.session_state['user_name'] = "Admin"
+                    st.rerun()
+                else:
+                    st.error("密码错误")
 
-    with col2:
-        st.subheader('实时日志')
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, 'r') as f:
-                lines = f.readlines()
-                st.code(''.join(lines[-20:]), language='text')
-            if st.button('清空日志'):
-                open(LOG_FILE, 'w').close()
-                st.rerun()
-        else:
-            st.info('暂无日志')
+# --- 主内容区域 (公开数据) ---
+def main_content():
+    st.title('📊 市场数据监控')
+    
+    # 确定要展示的目标地址
+    # 1. 优先使用已登录用户的配置
+    # 2. 如果未登录，尝试获取默认管理员配置
+    # 3. 允许用户在主界面手动输入/覆盖
+    
+    default_target = '0xdAe4DF7207feB3B350e4284C8eFe5f7DAc37f637'
+    default_refresh = 10
+    
+    # 尝试获取系统默认配置 (DEFAULT_USER_EMAIL)
+    system_config = db.get_user_config(DEFAULT_USER_EMAIL)
+    if system_config:
+        default_target = system_config.get('target_address', default_target)
+        default_refresh = system_config.get('auto_refresh_interval', 10)
+        
+    # 如果已登录，优先显示登录用户的配置
+    if 'user_email' in st.session_state:
+        user_config = db.get_user_config(st.session_state['user_email'])
+        if user_config:
+            default_target = user_config.get('target_address', default_target)
+            default_refresh = user_config.get('auto_refresh_interval', default_refresh)
 
-    # --- 目标用户数据监控 ---
-    st.divider()
+    # 允许用户临时修改监控目标 (不影响配置)
+    col_t1, col_t2 = st.columns([3, 1])
+    with col_t1:
+        current_target = st.text_input("监控目标地址", value=default_target, help="此处修改仅用于临时查看数据，不会修改后台跟单配置")
+    with col_t2:
+        if st.button("🔄 立即刷新"):
+            st.rerun()
+            
+    # 自动刷新
+    st_autorefresh(interval=default_refresh * 1000, key="data_refresh")
     
     if current_target:
-        col_mon, col_refresh = st.columns([3, 1])
-        with col_mon:
-            st.subheader(f"📊 目标用户监控: {current_target}")
-        with col_refresh:
-            if st.button("🔄 刷新数据"):
-                st.rerun()
-
         try:
             info = get_hl_info()
             # 获取用户状态 (包含持仓)
@@ -265,7 +262,7 @@ def main_app(email):
                 raw_open_orders = info.open_orders(current_target)
             except Exception as e_orders:
                 raw_open_orders = []
-                st.warning(f"获取挂单失败: {e_orders}")
+                # st.warning(f"获取挂单失败: {e_orders}") # 保持界面整洁，忽略非关键错误
 
             # 调试: 显示原始数据结构以便排查
             with st.expander("🔍 查看原始 API 响应 (调试用)"):
@@ -286,8 +283,12 @@ def main_app(email):
                         
                         display_orders = df_orders[['time', 'coin', 'side', 'limitPx', 'sz']].sort_values('time', ascending=False).reset_index(drop=True)
                         display_orders.index = display_orders.index + 1
-                        display_orders['time'] = format_beijing_time(display_orders['time'])
-                        st.dataframe(display_orders, width='stretch', height=1050)
+                        display_orders['time'] = format_time_with_label(display_orders['time'])
+                        st.dataframe(
+                            display_orders, 
+                            width='stretch', 
+                            height=800
+                        )
                 else:
                     st.info("当前无挂单")
                     
@@ -299,7 +300,7 @@ def main_app(email):
                     szi = float(core.get('szi', 0))
                     if szi != 0:
                         pos_data.append({
-                            "币种": p.get('coin'),
+                            "币种": core.get('coin'),
                             "持仓量": szi,
                             "入场价": float(core.get('entryPx', 0)),
                             "未实现盈亏": float(core.get('unrealizedPnl', 0)),
@@ -310,7 +311,7 @@ def main_app(email):
                 if pos_data:
                     df_pos = pd.DataFrame(pos_data)
                     df_pos.index = df_pos.index + 1
-                    st.dataframe(df_pos, width='stretch', height=1050)
+                    st.dataframe(df_pos, width='stretch', height=800)
                 else:
                     st.info("当前无持仓")
                     
@@ -326,8 +327,12 @@ def main_app(email):
                         
                         display_fills = df_fills[['time', 'coin', 'side', 'price', 'size', 'fee', 'closedPnl']].head(50)
                         display_fills.index = display_fills.index + 1
-                        display_fills['time'] = format_beijing_time(display_fills['time'])
-                        st.dataframe(display_fills, width='stretch', height=1050)
+                        display_fills['time'] = format_time_with_label(display_fills['time'])
+                        st.dataframe(
+                            display_fills, 
+                            width='stretch', 
+                            height=800
+                        )
                     else:
                         st.info("暂无可见成交记录")
                 except Exception as e:
@@ -336,59 +341,52 @@ def main_app(email):
         except Exception as e:
             st.error(f"获取链上数据失败: {e}")
 
-    # --- 历史数据下载 ---
+    # --- 历史数据下载 (公开) ---
     st.divider()
-    st.subheader("📥 历史数据下载")
-    st.info("说明: 只有在跟单程序运行时才会持续记录历史数据。")
-    
-    if st.button("生成历史数据 CSV"):
-        csvs = db.get_history_csv()
-        if csvs:
-            # 创建 ZIP 文件
-            buffer = io.BytesIO()
-            with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for name, data in csvs.items():
-                    zf.writestr(f"history_{name}.csv", data)
-            
-            st.download_button(
-                label="📦 下载全部历史数据 (ZIP)",
-                data=buffer.getvalue(),
-                file_name="all_history.zip",
-                mime="application/zip"
-            )
-            
-            # 同时也提供单独下载
-            col_d1, col_d2, col_d3 = st.columns(3)
-            with col_d1:
+    with st.expander("📥 历史数据下载 (点击展开)"):
+        st.info("说明: 只有在跟单程序运行时才会持续记录历史数据。")
+        
+        if st.button("生成历史数据 CSV"):
+            csvs = db.get_history_csv()
+            if csvs:
+                # 创建 ZIP 文件
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for name, data in csvs.items():
+                        zf.writestr(f"history_{name}.csv", data)
+                
                 st.download_button(
-                    label="下载 挂单历史 (CSV)",
-                    data=csvs.get('orders', ''),
-                    file_name='history_orders.csv',
-                    mime='text/csv'
+                    label="📦 下载全部历史数据 (ZIP)",
+                    data=buffer.getvalue(),
+                    file_name="all_history.zip",
+                    mime="application/zip"
                 )
-            with col_d2:
-                st.download_button(
-                    label="下载 成交历史 (CSV)",
-                    data=csvs.get('trades', ''),
-                    file_name='history_trades.csv',
-                    mime='text/csv'
-                )
-            with col_d3:
-                st.download_button(
-                    label="下载 持仓历史 (CSV)",
-                    data=csvs.get('positions', ''),
-                    file_name='history_positions.csv',
-                    mime='text/csv'
-                )
+            else:
+                st.warning("暂无历史数据或读取失败")
+
+    # --- 实时日志 (仅显示默认用户的日志) ---
+    # 虽然未登录，但既然是单用户系统，展示运行日志也是一种数据监控
+    st.divider()
+    with st.expander("📜 运行日志 (点击展开)"):
+        # 始终读取默认用户的日志
+        log_files = get_user_files(DEFAULT_USER_EMAIL)
+        LOG_FILE = log_files['log']
+        
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, 'r') as f:
+                lines = f.readlines()
+                st.code(''.join(lines[-20:]), language='text')
+            if st.button('刷新日志'):
+                st.rerun()
         else:
-            st.warning("暂无历史数据或读取失败")
+            st.info('暂无日志')
 
 @st.cache_resource
 def get_hl_info():
     return Info(constants.MAINNET_API_URL, skip_ws=True)
 
-def format_beijing_time(dt_series):
-    """将时间序列转换为北京时间并格式化显示"""
+def format_time_with_label(dt_series):
+    """将时间转换为北京时间字符串，保留ISO格式以支持排序，并附加友好标签"""
     beijing_tz = pytz.timezone('Asia/Shanghai')
     
     if not pd.api.types.is_datetime64_any_dtype(dt_series):
@@ -405,13 +403,13 @@ def format_beijing_time(dt_series):
     
     def fmt(t):
         d = t.date()
-        time_str = t.strftime('%H:%M:%S')
+        base_str = t.strftime('%Y-%m-%d %H:%M:%S')
         if d == today:
-            return f"今天 {time_str}"
+            return f"{base_str} (今天)"
         elif d == yesterday:
-            return f"昨天 {time_str}"
+            return f"{base_str} (昨天)"
         else:
-            return t.strftime('%Y-%m-%d %H:%M:%S')
+            return base_str
             
     return dt_series.apply(fmt)
 
@@ -427,7 +425,5 @@ if 'user_email' not in st.session_state:
     if cookie_email:
         st.session_state['user_email'] = cookie_email
 
-if 'user_email' in st.session_state:
-    main_app(st.session_state['user_email'])
-else:
-    login_page()
+sidebar_logic()
+main_content()

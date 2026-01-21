@@ -72,7 +72,14 @@ class HyperliquidCopier:
         logger.info(f"跟单模式: {SYNC_MODE} ({'同步持仓' if SYNC_MODE == 'full' else '仅同步下单'})")
 
     def get_user_state(self, address):
-        return self.info.user_state(address)
+        state = self.info.user_state(address)
+        try:
+            orders = self.info.open_orders(address)
+            state['openOrders'] = orders
+        except Exception as e:
+            logger.warning(f"获取挂单失败 {address}: {e}")
+            state['openOrders'] = []
+        return state
 
     def round_sz(self, coin, sz):
         """根据币种精度修剪数量"""
@@ -86,8 +93,17 @@ class HyperliquidCopier:
 
     def sync_positions(self, target_state, my_state):
         """同步仓位 (市价单修补)"""
-        target_positions = {p['coin']: float(p['szi']) for p in target_state['assetPositions']}
-        my_positions = {p['coin']: float(p['szi']) for p in my_state['assetPositions']}
+        def parse_positions(state):
+            pos_map = {}
+            for p in state.get('assetPositions', []):
+                core = p.get('position', p)
+                coin = core.get('coin')
+                if coin:
+                    pos_map[coin] = float(core.get('szi', 0))
+            return pos_map
+
+        target_positions = parse_positions(target_state)
+        my_positions = parse_positions(my_state)
         
         # 模式2: 初始化基准
         if SYNC_MODE == 'order' and not self.initialized_baseline:

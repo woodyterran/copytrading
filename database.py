@@ -32,6 +32,14 @@ def init_db():
     except sqlite3.OperationalError:
         pass # 列已存在
         
+    # --- 全局设置表 ---
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -214,3 +222,26 @@ def save_user_config(email, private_key, target_address, copy_ratio, slippage, s
     ''', (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval))
     conn.commit()
     conn.close()
+
+def get_admin_password():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute('SELECT value FROM app_settings WHERE key = ?', ('admin_password',))
+        row = c.fetchone()
+        return row[0] if row else None
+    except:
+        return None
+    finally:
+        conn.close()
+
+def set_admin_password(password):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)', ('admin_password', password))
+        conn.commit()
+    except Exception as e:
+        print(f"Set password error: {e}")
+    finally:
+        conn.close()
