@@ -9,6 +9,7 @@ from eth_account import Account
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
+import database as db
 
 # --- 配置区域 ---
 
@@ -63,6 +64,11 @@ class HyperliquidCopier:
         self.my_baseline = {}
         self.initialized_baseline = False
         
+        # 历史记录缓存 (去重用)
+        self.seen_oids = set()
+        self.seen_fill_hashes = set()
+        self.last_position_snapshot = {}
+
         logger.info(f"跟单模式: {SYNC_MODE} ({'同步持仓' if SYNC_MODE == 'full' else '仅同步下单'})")
 
     def get_user_state(self, address):
@@ -194,16 +200,73 @@ class HyperliquidCopier:
                     except Exception as e:
                         logger.error(f"挂单失败: {e}")
 
+    def update_history(self, target_state):
+        """更新历史记录到数据库"""
+        try:
+            # 1. 记录挂单
+            # 注意: 这里只记录看到的 open orders。如果需要记录 cancel/fill，需要更复杂的逻辑或 stream。
+            # 目前只记录出现过的挂单 (oid 唯一)
+            for o in target_state['openOrders']:
+                if o['oid'] not in self.seen_oids:
+                    db.log_order(TARGET_ADDRESS, o)
+                    self.seen_oids.add(o['oid'])
+            
+            # 2. 记录持仓 (仅当发生变化时)
+            # 过滤掉 szi=0 的空仓位
+            current_positions = {p['coin']: p for p in target_state['assetPositions'] if float(p['szi']) != 0}
+            
+            for coin, pos in current_positions.items():
+                prev_pos = self.last_position_snapshot.get(coin)
+                # 检查是否发生变化 (数量或入场价)
+                is_changed = False
+                if not prev_pos:
+                    is_changed = True
+                else:
+                    if float(prev_pos['szi']) != float(pos['szi']):
+                        is_changed = True
+                    elif float(prev_pos.get('entryPx', 0)) != float(pos.get('entryPx', 0)):
+                        is_changed = True
+                
+                if is_changed:
+                    db.log_position(TARGET_ADDRESS, pos)
+                    self.last_position_snapshot[coin] = pos.copy()
+
+            # 3. 记录成交
+            # user_fills 接口获取最近成交
+            fills = self.info.user_fills(TARGET_ADDRESS)
+            for fill in fills:
+                # 构建唯一标识，SDK 返回的 fill可能有 hash，也可能没有，用 tid+coin 兜底
+                # 注意: fill 结构可能随 SDK 版本变化，这里做一定容错
+                fill_hash = fill.get('hash') or f"{fill.get('tid')}_{fill.get('coin')}"
+                
+                if fill_hash not in self.seen_fill_hashes:
+                    db.log_trade(TARGET_ADDRESS, fill)
+                    self.seen_fill_hashes.add(fill_hash)
+                    
+        except Exception as e:
+            # 历史记录错误不应中断主流程
+            logger.error(f"历史记录更新失败: {e}")
+
     def run(self):
         logger.info("跟单程序已启动...")
         while True:
             try:
+                # 1. 获取目标状态
                 target_state = self.get_user_state(TARGET_ADDRESS)
+                
+                # 更新历史记录
+                self.update_history(target_state)
+
+                # 2. 获取我的状态
                 my_state = self.get_user_state(self.my_address)
+                
+                # 3. 执行同步
                 self.sync_positions(target_state, my_state)
                 self.sync_open_orders(target_state, my_state)
+                
             except Exception as e:
-                logger.error(f"轮询错误: {e}")
+                logger.error(f"轮询出错: {e}")
+            
             time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":

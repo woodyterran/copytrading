@@ -7,6 +7,8 @@ import signal
 import sys
 import pandas as pd
 import hashlib
+import zipfile
+import io
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
@@ -16,6 +18,9 @@ from google_auth_oauthlib.flow import Flow
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import database as db
+
+from streamlit_autorefresh import st_autorefresh
+import extra_streamlit_components as stx
 
 # --- 配置 ---
 st.set_page_config(page_title='Hyperliquid 跟单机器人', layout='wide')
@@ -27,6 +32,12 @@ SCOPES = ['openid', 'https://www.googleapis.com/auth/userinfo.email', 'https://w
 
 # 初始化数据库
 db.init_db()
+
+# @st.cache_resource
+def get_cookie_manager():
+    return stx.CookieManager()
+
+cookie_manager = get_cookie_manager()
 
 # --- Google Auth 辅助函数 ---
 def get_auth_flow():
@@ -111,6 +122,9 @@ def login_page():
             user_info = verify_google_token(credentials.id_token)
             
             if user_info:
+                # 设置 Cookie (有效期 30 天)
+                expires_at = datetime.now() + timedelta(days=30)
+                cookie_manager.set('user_email', user_info['email'], key="set_email", expires_at=expires_at)
                 st.session_state['user_email'] = user_info['email']
                 st.session_state['user_name'] = user_info.get('name', 'User')
                 # 清除 URL 参数
@@ -118,7 +132,7 @@ def login_page():
                 st.rerun()
         except Exception as e:
             st.error(f"登录失败: {e}")
-            
+        
     if st.button('使用 Google 账号登录'):
         flow = get_auth_flow()
         auth_url, _ = flow.authorization_url(prompt='consent')
@@ -128,7 +142,9 @@ def login_page():
 def main_app(email):
     st.sidebar.success(f"已登录: {email}")
     if st.sidebar.button("登出"):
-        del st.session_state['user_email']
+        cookie_manager.delete('user_email', key="del_email")
+        if 'user_email' in st.session_state:
+            del st.session_state['user_email']
         st.rerun()
 
     st.title('🤖 Hyperliquid 跟单机器人控制台')
@@ -158,10 +174,12 @@ def main_app(email):
             help="同步持仓: 初始时将仓位调整至目标一致。\n仅同步下单: 初始不调整仓位，仅跟随后续的挂单和市价单。"
         )
         
+        auto_refresh_interval = st.number_input('监控自动刷新间隔 (秒)', value=int(user_config.get('auto_refresh_interval', 10)), min_value=1, step=1, help="设置监控目标用户数据的自动刷新时间间隔")
+
         submitted = st.form_submit_button('保存配置')
         
         if submitted:
-            db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode)
+            db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval)
             st.sidebar.success('配置已保存！')
             # 重新加载以更新界面
             st.rerun()
@@ -169,6 +187,10 @@ def main_app(email):
     # 如果没有配置，提示先配置
     current_target = user_config.get('target_address')
     
+    # --- 自动刷新 ---
+    refresh_interval = user_config.get('auto_refresh_interval', 10)
+    st_autorefresh(interval=refresh_interval * 1000, key="data_refresh")
+
     # --- 机器人控制 ---
     pid = get_bot_pid(PID_FILE)
     is_running = pid is not None
@@ -314,6 +336,53 @@ def main_app(email):
         except Exception as e:
             st.error(f"获取链上数据失败: {e}")
 
+    # --- 历史数据下载 ---
+    st.divider()
+    st.subheader("📥 历史数据下载")
+    st.info("说明: 只有在跟单程序运行时才会持续记录历史数据。")
+    
+    if st.button("生成历史数据 CSV"):
+        csvs = db.get_history_csv()
+        if csvs:
+            # 创建 ZIP 文件
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for name, data in csvs.items():
+                    zf.writestr(f"history_{name}.csv", data)
+            
+            st.download_button(
+                label="📦 下载全部历史数据 (ZIP)",
+                data=buffer.getvalue(),
+                file_name="all_history.zip",
+                mime="application/zip"
+            )
+            
+            # 同时也提供单独下载
+            col_d1, col_d2, col_d3 = st.columns(3)
+            with col_d1:
+                st.download_button(
+                    label="下载 挂单历史 (CSV)",
+                    data=csvs.get('orders', ''),
+                    file_name='history_orders.csv',
+                    mime='text/csv'
+                )
+            with col_d2:
+                st.download_button(
+                    label="下载 成交历史 (CSV)",
+                    data=csvs.get('trades', ''),
+                    file_name='history_trades.csv',
+                    mime='text/csv'
+                )
+            with col_d3:
+                st.download_button(
+                    label="下载 持仓历史 (CSV)",
+                    data=csvs.get('positions', ''),
+                    file_name='history_positions.csv',
+                    mime='text/csv'
+                )
+        else:
+            st.warning("暂无历史数据或读取失败")
+
 @st.cache_resource
 def get_hl_info():
     return Info(constants.MAINNET_API_URL, skip_ws=True)
@@ -347,6 +416,17 @@ def format_beijing_time(dt_series):
     return dt_series.apply(fmt)
 
 # --- 入口逻辑 ---
+# 本地测试版本：直接使用默认账户，移除 Google 登录
+# if 'user_email' not in st.session_state:
+#     st.session_state['user_email'] = 'admin@local'
+#     st.session_state['user_name'] = 'Admin'
+
+# 检查 Cookie 是否存在已登录用户
+if 'user_email' not in st.session_state:
+    cookie_email = cookie_manager.get('user_email')
+    if cookie_email:
+        st.session_state['user_email'] = cookie_email
+
 if 'user_email' in st.session_state:
     main_app(st.session_state['user_email'])
 else:
