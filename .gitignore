@@ -17,6 +17,10 @@ history.db
 __pycache__/
 *.pyc
 
+# Virtual Environment
+venv/
+env/
+
 # Mac system files
 .DS_Store
 
