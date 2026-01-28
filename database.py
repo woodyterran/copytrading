@@ -31,6 +31,18 @@ def init_db():
         c.execute('ALTER TABLE users ADD COLUMN auto_refresh_interval INTEGER DEFAULT 10')
     except sqlite3.OperationalError:
         pass # 列已存在
+
+    # 尝试添加 market_type 列（如果不存在）
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN market_type TEXT DEFAULT "perps"')
+    except sqlite3.OperationalError:
+        pass # 列已存在
+        
+    # 尝试添加 my_address 列（如果不存在）
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN my_address TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass # 列已存在
         
     # --- 全局设置表 ---
     c.execute('''
@@ -199,7 +211,7 @@ def get_history_csv():
 def get_user_config(email):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval FROM users WHERE email = ?', (email,))
+    c.execute('SELECT private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address FROM users WHERE email = ?', (email,))
     row = c.fetchone()
     conn.close()
     if row:
@@ -209,17 +221,19 @@ def get_user_config(email):
             'copy_ratio': row[2],
             'slippage': row[3],
             'sync_mode': row[4] if len(row) > 4 else 'full',
-            'auto_refresh_interval': row[5] if len(row) > 5 else 10
+            'auto_refresh_interval': row[5] if len(row) > 5 else 10,
+            'market_type': row[6] if len(row) > 6 else 'perps',
+            'my_address': row[7] if len(row) > 7 else ''
         }
     return None
 
-def save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode='full', auto_refresh_interval=10):
+def save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode='full', auto_refresh_interval=10, market_type='perps', my_address=''):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        INSERT OR REPLACE INTO users (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval))
+        INSERT OR REPLACE INTO users (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address))
     conn.commit()
     conn.close()
 

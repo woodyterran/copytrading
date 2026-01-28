@@ -91,9 +91,35 @@ def sidebar_logic():
         user_config = db.get_user_config(email) or {}
         
         with st.sidebar.form('config_form'):
+            market_type_options = {'perps': '合约 (Perpetuals)', 'spot': '现货 (Spot)'}
+            market_type_val = user_config.get('market_type', 'perps')
+            
+            # 兼容旧配置：如果是单字符串，转换为列表
+            default_types = []
+            if market_type_val:
+                # 检查是否包含逗号
+                if ',' in market_type_val:
+                    default_types = [x.strip() for x in market_type_val.split(',')]
+                elif market_type_val in market_type_options:
+                    default_types = [market_type_val]
+            if not default_types:
+                default_types = ['perps'] # 默认选中合约
+
+            market_types = st.multiselect(
+                '交易类型',
+                options=list(market_type_options.keys()),
+                format_func=lambda x: market_type_options[x],
+                default=default_types,
+                help="可同时选择现货和合约进行跟单"
+            )
+            
             private_key = st.text_input('私钥 (MY_PRIVATE_KEY)', value=user_config.get('private_key', ''), type='password')
+            
+            # 新增：主账户地址配置
+            my_address = st.text_input('主账户地址 (MY_ADDRESS)', value=user_config.get('my_address', ''), help="如果您的私钥是Agent私钥，请在此填写您的主账户地址。如果私钥即为主账户私钥，可留空。")
+            
             target_address = st.text_input('目标地址', value=user_config.get('target_address', '0xdAe4DF7207feB3B350e4284C8eFe5f7DAc37f637'))
-            copy_ratio = st.number_input('跟单比例', value=float(user_config.get('copy_ratio', 0.1)), min_value=0.01, step=0.01, format='%.2f')
+            copy_ratio = st.number_input('跟单比例', value=float(user_config.get('copy_ratio', 1.0)), min_value=0.01, step=0.01, format='%.2f')
             slippage = st.number_input('最大滑点', value=float(user_config.get('slippage', 0.02)), min_value=0.01, step=0.01)
             
             sync_mode_options = {'full': '同步持仓 (Full Sync)', 'order': '仅同步下单 (Orders Only)'}
@@ -111,7 +137,9 @@ def sidebar_logic():
             submitted = st.form_submit_button('保存配置')
             
             if submitted:
-                db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval)
+                # 将列表转换为逗号分隔的字符串
+                market_type_str = ",".join(market_types)
+                db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type_str, my_address=my_address)
                 st.sidebar.success('配置已保存！')
                 st.rerun()
 
@@ -149,6 +177,8 @@ def sidebar_logic():
                     env['SLIPPAGE'] = str(cfg['slippage'])
                     env['SYNC_MODE'] = str(cfg.get('sync_mode', 'full'))
                     env['AUTO_REFRESH_INTERVAL'] = str(cfg.get('auto_refresh_interval', 10))
+                    env['MARKET_TYPE'] = str(cfg.get('market_type', 'perps'))
+                    env['MY_ADDRESS'] = str(cfg.get('my_address', ''))
                     
                     with open(LOG_FILE, 'a') as log_f:
                         proc = subprocess.Popen(
