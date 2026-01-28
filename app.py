@@ -9,6 +9,7 @@ import pandas as pd
 import hashlib
 import zipfile
 import io
+import re
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
@@ -170,11 +171,12 @@ def sidebar_logic():
             st.sidebar.warning('⚪ 已停止')
             if st.sidebar.button('🟢 启动机器人'):
                 cfg = db.get_user_config(email)
-                if not cfg or not cfg.get('private_key'):
-                    st.sidebar.error("请先保存配置（特别是私钥）")
+                if not cfg:
+                    st.sidebar.error("请先保存配置")
                 else:
                     env = os.environ.copy()
-                    env['MY_PRIVATE_KEY'] = cfg['private_key']
+                    # 允许私钥为空（模拟模式）
+                    env['MY_PRIVATE_KEY'] = cfg.get('private_key', '')
                     env['TARGET_ADDRESS'] = cfg['target_address']
                     env['COPY_RATIO'] = str(cfg['copy_ratio'])
                     env['SLIPPAGE'] = str(cfg['slippage'])
@@ -408,11 +410,77 @@ def main_content():
         LOG_FILE = log_files['log']
         
         if os.path.exists(LOG_FILE):
+            col_l1, col_l2, col_l3 = st.columns([2, 2, 2])
+            with col_l1:
+                log_lines_count = st.selectbox("显示行数", [20, 50, 100, 200, 500, 1000, 5000], index=0)
+            
             with open(LOG_FILE, 'r') as f:
                 lines = f.readlines()
-                st.code(''.join(lines[-20:]), language='text')
-            if st.button('刷新日志'):
-                st.rerun()
+                total_lines = len(lines)
+                display_lines = lines[-log_lines_count:]
+                st.code(''.join(display_lines), language='text')
+                st.caption(f"共 {total_lines} 行日志，当前显示最后 {len(display_lines)} 行")
+
+            with col_l2:
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    if st.button('🔄 刷新日志'):
+                        st.rerun()
+                with c2:
+                    if st.button('🗑️ 清空日志'):
+                        try:
+                            # 清空文件内容
+                            open(LOG_FILE, 'w').close()
+                            st.success("已清空")
+                            time.sleep(0.5)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"失败: {e}")
+            
+            # --- 下载功能 ---
+            with col_l3:
+                # 1. 下载原始日志
+                with open(LOG_FILE, 'rb') as f:
+                    st.download_button(
+                        label="📥 下载原始日志 (.log)",
+                        data=f,
+                        file_name=f"bot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+                        mime="text/plain"
+                    )
+            
+            # 2. 导出 CSV
+            def parse_log_to_csv(log_path):
+                data = []
+                pattern = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - (\w+) - (.*)$')
+                try:
+                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        for line in f:
+                            match = pattern.match(line.strip())
+                            if match:
+                                data.append({
+                                    'Time': match.group(1),
+                                    'Level': match.group(2),
+                                    'Message': match.group(3)
+                                })
+                            elif data: # Append non-matching lines (like tracebacks) to previous message
+                                data[-1]['Message'] += " | " + line.strip()
+                except Exception as e:
+                    return None
+                
+                if not data:
+                    return None
+                
+                df = pd.DataFrame(data)
+                return df.to_csv(index=False).encode('utf-8-sig')
+
+            csv_data = parse_log_to_csv(LOG_FILE)
+            if csv_data:
+                st.download_button(
+                    label="📊 导出日志 CSV",
+                    data=csv_data,
+                    file_name=f"bot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
         else:
             st.info('暂无日志')
 

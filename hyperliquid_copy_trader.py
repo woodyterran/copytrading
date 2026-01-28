@@ -49,26 +49,106 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class MockExchange:
+    """模拟交易所，用于无私钥模式下的模拟跟单"""
+    def __init__(self, account_address):
+        self.account_address = account_address
+        self.positions = {}  # coin -> float(szi)
+        self.orders = []     # list of order dicts
+        self.order_id_counter = 1
+
+    def market_open(self, coin, is_buy, sz, px, slippage):
+        # 模拟成交
+        side = "B" if is_buy else "A"
+        logger.info(f"[模拟操作] 市价{'买入' if is_buy else '卖出'} {coin} 数量:{sz} 价格:{px}")
+        
+        # 更新模拟持仓
+        current_sz = self.positions.get(coin, 0.0)
+        delta = sz if is_buy else -sz
+        new_sz = current_sz + delta
+        self.positions[coin] = new_sz
+        
+        # 简单的浮点数精度处理
+        if abs(self.positions[coin]) < 1e-6:
+             self.positions[coin] = 0.0
+
+        return {'status': 'ok', 'response': {'data': {'statuses': [{}]}}}
+
+    def order(self, coin, is_buy, sz, limit_px, order_type, reduce_only=False):
+        # 模拟挂单
+        side = "B" if is_buy else "A"
+        oid = self.order_id_counter
+        self.order_id_counter += 1
+        
+        logger.info(f"[模拟操作] 限价挂单 {coin} {side} 数量:{sz} 价格:{limit_px}")
+        
+        new_order = {
+            'coin': coin,
+            'side': side,
+            'limitPx': str(limit_px),
+            'sz': str(sz),
+            'oid': oid,
+            'timestamp': int(time.time() * 1000)
+        }
+        self.orders.append(new_order)
+        
+        return {'status': 'ok', 'response': {'data': {'statuses': [{}]}}}
+
+    def bulk_cancel(self, cancels):
+        # 模拟撤单
+        logger.info(f"[模拟操作] 批量撤单: {cancels}")
+        
+        # 从模拟挂单列表中移除
+        # cancels 是 [{'coin': 'PURR', 'oid': 123}, ...]
+        ids_to_cancel = set(c['oid'] for c in cancels)
+        self.orders = [o for o in self.orders if o['oid'] not in ids_to_cancel]
+        
+        return {'status': 'ok', 'response': {'data': {'statuses': [{}]}}}
+
 class HyperliquidCopier:
     def __init__(self):
         self.private_key = os.getenv("MY_PRIVATE_KEY")
-        if not self.private_key or "YourPrivateKeyHere" in self.private_key:
-            raise ValueError("错误: 请先在 .env 文件中填入正确的私钥 (MY_PRIVATE_KEY)")
         
-        self.account = Account.from_key(self.private_key)
-        # 允许显式指定主账户地址，否则使用私钥推导的地址
-        self.my_address = os.getenv("MY_ADDRESS", self.account.address)
-        if not self.my_address or "YourPublicAddressHere" in self.my_address:
-             self.my_address = self.account.address
+        # 检查是否为模拟模式 (私钥为空或包含占位符)
+        self.is_dry_run = False
+        if not self.private_key or "YourPrivateKeyHere" in self.private_key:
+            self.is_dry_run = True
+            self.private_key = None # 明确设为 None
+        
+        if self.is_dry_run:
+            logger.warning("⚠️ 私钥未设置，进入 [模拟操作模式]")
+            # 模拟模式下使用随机或配置的地址
+            self.my_address = os.getenv("MY_ADDRESS", "0x0000000000000000000000000000000000000000")
+            self.account = None
+        else:
+            try:
+                self.account = Account.from_key(self.private_key)
+                # 允许显式指定主账户地址，否则使用私钥推导的地址
+                self.my_address = os.getenv("MY_ADDRESS", self.account.address)
+                if not self.my_address or "YourPublicAddressHere" in self.my_address:
+                     self.my_address = self.account.address
+            except Exception as e:
+                logger.error(f"私钥格式错误，切换至模拟模式: {e}")
+                self.is_dry_run = True
+                self.my_address = os.getenv("MY_ADDRESS", "0x0000000000000000000000000000000000000000")
+                self.account = None
 
         logger.info(f"启动跟单程序 | 我的主账户地址: {self.my_address}")
-        logger.info(f"签名代理地址(Agent): {self.account.address}")
+        if not self.is_dry_run:
+            logger.info(f"签名代理地址(Agent): {self.account.address}")
+        else:
+             logger.info(f"运行模式: [模拟跟单]")
+
         logger.info(f"目标地址: {TARGET_ADDRESS} | 跟单比例: {COPY_RATIO}")
 
         # 初始化 SDK
         self.info = Info(constants.MAINNET_API_URL, skip_ws=True)
-        # 关键: Exchange 初始化时，如果使用 Agent 模式，需要传入主账户地址作为 account_address
-        self.exchange = Exchange(self.account, constants.MAINNET_API_URL, account_address=self.my_address)
+        
+        if self.is_dry_run:
+            self.exchange = MockExchange(self.my_address)
+        else:
+            # 关键: Exchange 初始化时，如果使用 Agent 模式，需要传入主账户地址作为 account_address
+            self.exchange = Exchange(self.account, constants.MAINNET_API_URL, account_address=self.my_address)
 
         
         # 初始化 Spot Universe
@@ -133,7 +213,28 @@ class HyperliquidCopier:
         return asset_id >= 10000
 
     def get_user_state(self, address):
+        # 模拟模式下，如果是查询我的地址，直接返回内存中的模拟状态
+        if self.is_dry_run and address == self.my_address:
+             state = {'assetPositions': [], 'openOrders': []}
+             
+             # 构造持仓
+             # self.exchange 是 MockExchange 实例
+             for coin, szi in self.exchange.positions.items():
+                 if szi != 0:
+                     state['assetPositions'].append({
+                         'position': {
+                             'coin': coin,
+                             'szi': str(szi),
+                             'entryPx': 0.0
+                         }
+                     })
+             
+             # 构造挂单
+             state['openOrders'] = list(self.exchange.orders)
+             return state
+
         state = {'assetPositions': [], 'openOrders': []}
+        success = True
         
         # 1. 获取现货状态
         if 'spot' in MARKET_TYPES:
@@ -160,6 +261,7 @@ class HyperliquidCopier:
                     })
             except Exception as e:
                 logger.error(f"获取现货状态失败 {address}: {e}")
+                success = False
         
         # 2. 获取合约状态
         if 'perps' in MARKET_TYPES:
@@ -170,6 +272,7 @@ class HyperliquidCopier:
                     state['assetPositions'].extend(perp_state['assetPositions'])
             except Exception as e:
                 logger.error(f"获取合约状态失败 {address}: {e}")
+                success = False
 
         # 3. 获取挂单并过滤
         try:
@@ -203,9 +306,11 @@ class HyperliquidCopier:
             state['openOrders'] = filtered_orders
         except Exception as e:
             logger.warning(f"获取挂单失败 {address}: {e}")
+            # 挂单失败通常不致命，但也可能导致误撤单。安全起见，如果不完整，也视为失败。
             state['openOrders'] = []
+            success = False
             
-        return state
+        return state if success else None
 
     def round_sz(self, coin, sz):
         """根据币种精度修剪数量"""
@@ -309,9 +414,10 @@ class HyperliquidCopier:
         # -----------------------
 
         # DEBUG LOG
-        logger.info(f"[DEBUG] 同步检查 | 目标挂单数: {len(target_orders)} | 我的挂单数: {len(my_orders)}")
+        # logger.info(f"[DEBUG] 同步检查 | 目标挂单数: {len(target_orders)} | 我的挂单数: {len(my_orders)}")
         if len(my_orders) > 0:
-            logger.info(f"[DEBUG] 我的首个挂单: {my_orders[0]}")
+            pass
+            # logger.info(f"[DEBUG] 我的首个挂单: {my_orders[0]}")
         
         # 1. 构建指纹映射
         # 指纹: (coin, side, price) -> 详情
@@ -465,11 +571,21 @@ class HyperliquidCopier:
                 # 1. 获取目标状态
                 target_state = self.get_user_state(TARGET_ADDRESS)
                 
+                if target_state is None:
+                    logger.warning(f"获取目标状态失败 (可能由于网络或API限制)，跳过本次同步")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
                 # 更新历史记录
                 self.update_history(target_state)
 
                 # 2. 获取我的状态
                 my_state = self.get_user_state(self.my_address)
+                
+                if my_state is None:
+                    logger.warning(f"获取我的状态失败 (可能由于网络或API限制)，跳过本次同步")
+                    time.sleep(POLL_INTERVAL)
+                    continue
                 
                 # 3. 执行同步
                 self.sync_positions(target_state, my_state)
