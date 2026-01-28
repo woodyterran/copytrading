@@ -43,6 +43,18 @@ def init_db():
         c.execute('ALTER TABLE users ADD COLUMN my_address TEXT DEFAULT ""')
     except sqlite3.OperationalError:
         pass # 列已存在
+
+    # 尝试添加 sync_perp_orders 列（如果不存在）
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN sync_perp_orders INTEGER DEFAULT 1')
+    except sqlite3.OperationalError:
+        pass # 列已存在
+
+    # 尝试添加 sync_spot_orders 列（如果不存在）
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN sync_spot_orders INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass # 列已存在
         
     # --- 全局设置表 ---
     c.execute('''
@@ -211,7 +223,7 @@ def get_history_csv():
 def get_user_config(email):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address FROM users WHERE email = ?', (email,))
+    c.execute('SELECT private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, sync_perp_orders, sync_spot_orders FROM users WHERE email = ?', (email,))
     row = c.fetchone()
     conn.close()
     if row:
@@ -223,17 +235,19 @@ def get_user_config(email):
             'sync_mode': row[4] if len(row) > 4 else 'full',
             'auto_refresh_interval': row[5] if len(row) > 5 else 10,
             'market_type': row[6] if len(row) > 6 else 'perps',
-            'my_address': row[7] if len(row) > 7 else ''
+            'my_address': row[7] if len(row) > 7 else '',
+            'sync_perp_orders': bool(row[8]) if len(row) > 8 else True,
+            'sync_spot_orders': bool(row[9]) if len(row) > 9 else False
         }
     return None
 
-def save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode='full', auto_refresh_interval=10, market_type='perps', my_address=''):
+def save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode='full', auto_refresh_interval=10, market_type='perps', my_address='', sync_perp_orders=True, sync_spot_orders=False):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        INSERT OR REPLACE INTO users (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address))
+        INSERT OR REPLACE INTO users (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, sync_perp_orders, sync_spot_orders)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, int(sync_perp_orders), int(sync_spot_orders)))
     conn.commit()
     conn.close()
 

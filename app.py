@@ -131,6 +131,10 @@ def sidebar_logic():
                 index=0 if sync_mode_val == 'full' else 1,
                 help="同步持仓: 初始时将仓位调整至目标一致。\n仅同步下单: 初始不调整仓位，仅跟随后续的挂单和市价单。"
             )
+
+            st.markdown("#### 挂单同步选项")
+            sync_perp_orders = st.checkbox('同步合约挂单', value=bool(user_config.get('sync_perp_orders', True)))
+            sync_spot_orders = st.checkbox('同步现货挂单', value=bool(user_config.get('sync_spot_orders', False)))
             
             auto_refresh_interval = st.number_input('监控自动刷新间隔 (秒)', value=int(user_config.get('auto_refresh_interval', 10)), min_value=1, step=1, help="设置监控目标用户数据的自动刷新时间间隔")
 
@@ -139,9 +143,8 @@ def sidebar_logic():
             if submitted:
                 # 将列表转换为逗号分隔的字符串
                 market_type_str = ",".join(market_types)
-                db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type_str, my_address=my_address)
-                st.sidebar.success('配置已保存！')
-                st.rerun()
+                db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type=market_type_str, my_address=my_address, sync_perp_orders=sync_perp_orders, sync_spot_orders=sync_spot_orders)
+                st.sidebar.success('✅配置已保存')
 
         st.sidebar.divider()
         st.sidebar.subheader('状态控制')
@@ -179,6 +182,8 @@ def sidebar_logic():
                     env['AUTO_REFRESH_INTERVAL'] = str(cfg.get('auto_refresh_interval', 10))
                     env['MARKET_TYPE'] = str(cfg.get('market_type', 'perps'))
                     env['MY_ADDRESS'] = str(cfg.get('my_address', ''))
+                    env['SYNC_PERP_ORDERS'] = '1' if cfg.get('sync_perp_orders', True) else '0'
+                    env['SYNC_SPOT_ORDERS'] = '1' if cfg.get('sync_spot_orders', False) else '0'
                     
                     with open(LOG_FILE, 'a') as log_f:
                         proc = subprocess.Popen(

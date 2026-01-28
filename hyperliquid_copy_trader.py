@@ -38,6 +38,10 @@ MARKET_TYPES = [t.strip() for t in MARKET_TYPE_STR.split(",") if t.strip()]
 if not MARKET_TYPES:
     MARKET_TYPES = ["perps"]
 
+# 挂单同步开关
+SYNC_PERP_ORDERS = os.getenv("SYNC_PERP_ORDERS", "1") == "1"
+SYNC_SPOT_ORDERS = os.getenv("SYNC_SPOT_ORDERS", "0") == "1"
+
 # 日志设置
 logging.basicConfig(
     level=logging.INFO,
@@ -287,10 +291,23 @@ class HyperliquidCopier:
                     logger.error(f"[{coin}] 下单异常: {e}")
 
     def sync_open_orders(self, target_state, my_state):
-        """同步挂单 (新逻辑: 优先清理，高价优先挂单，保证金检查)"""
+        """同步挂单 (新逻辑: 优先清理，高价优先挂单，保证金检查，支持过滤)"""
         target_orders = target_state.get('openOrders', [])
         my_orders = my_state.get('openOrders', [])
         
+        # --- 过滤逻辑 (Local) ---
+        def is_allowed_order(o):
+            is_spot = self.is_spot_asset(o['coin'])
+            if is_spot:
+                return SYNC_SPOT_ORDERS
+            else:
+                return SYNC_PERP_ORDERS
+
+        # 过滤
+        target_orders = [o for o in target_orders if is_allowed_order(o)]
+        my_orders = [o for o in my_orders if is_allowed_order(o)]
+        # -----------------------
+
         # DEBUG LOG
         logger.info(f"[DEBUG] 同步检查 | 目标挂单数: {len(target_orders)} | 我的挂单数: {len(my_orders)}")
         if len(my_orders) > 0:
