@@ -550,7 +550,18 @@ class HyperliquidCopier:
 
             # 3. 记录成交
             # user_fills 接口获取最近成交
-            fills = self.info.user_fills(TARGET_ADDRESS)
+            fills = []
+            max_retries = 3
+            for i in range(max_retries):
+                try:
+                    fills = self.info.user_fills(TARGET_ADDRESS)
+                    break
+                except Exception as e:
+                    if i == max_retries - 1:
+                        logger.warning(f"获取成交记录失败 (重试{max_retries}次后放弃): {e}")
+                    else:
+                        time.sleep(1)
+
             for fill in fills:
                 # 构建唯一标识，SDK 返回的 fill可能有 hash，也可能没有，用 tid+coin 兜底
                 # 注意: fill 结构可能随 SDK 版本变化，这里做一定容错
