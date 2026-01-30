@@ -252,6 +252,19 @@ def sidebar_logic():
                 else:
                     st.error("密码错误")
 
+# --- 辅助函数 ---
+def retry_api_call(func, *args, retries=3, delay=1, **kwargs):
+    """带重试机制的 API 调用 helper"""
+    last_exception = None
+    for i in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            if i < retries - 1:
+                time.sleep(delay)
+    raise last_exception
+
 # --- 主内容区域 (公开数据) ---
 def main_content():
     st.title('📊 市场数据监控')
@@ -291,12 +304,12 @@ def main_content():
     if current_target:
         try:
             info = get_hl_info()
-            # 获取用户状态 (包含持仓)
-            user_state = info.user_state(current_target)
+            # 获取用户状态 (包含持仓) - 增加重试
+            user_state = retry_api_call(info.user_state, current_target)
             
-            # 显式获取挂单
+            # 显式获取挂单 - 增加重试
             try:
-                raw_open_orders = info.open_orders(current_target)
+                raw_open_orders = retry_api_call(info.open_orders, current_target)
             except Exception as e_orders:
                 raw_open_orders = []
                 # st.warning(f"获取挂单失败: {e_orders}") # 保持界面整洁，忽略非关键错误
@@ -355,7 +368,7 @@ def main_content():
             with tab_trades:
                 try:
                     # 注意: user_fills 对于非本人地址可能返回空或报错，视 API 权限而定
-                    fills = info.user_fills(current_target)
+                    fills = retry_api_call(info.user_fills, current_target)
                     if fills:
                         df_fills = pd.DataFrame(fills)
                         df_fills['price'] = df_fills['px'].astype(float)
