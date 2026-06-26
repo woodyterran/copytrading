@@ -1,5 +1,7 @@
 import os
 import time
+import signal
+import subprocess
 import logging
 import math
 from decimal import Decimal
@@ -41,6 +43,26 @@ if not MARKET_TYPES:
 # 挂单同步开关
 SYNC_PERP_ORDERS = os.getenv("SYNC_PERP_ORDERS", "1") == "1"
 SYNC_SPOT_ORDERS = os.getenv("SYNC_SPOT_ORDERS", "0") == "1"
+
+# 币种白名单 (逗号分隔，如 "BTC,ETH"；留空表示跟单所有币种)
+_copy_coins_raw = os.getenv("COPY_COINS", "")
+COPY_COINS = set(c.strip().upper() for c in _copy_coins_raw.split(",") if c.strip()) if _copy_coins_raw.strip() else set()
+
+# 禁用代理以防止 ConnectionResetError
+os.environ['no_proxy'] = 'api.hyperliquid.xyz,api-ui.hyperliquid.xyz'
+
+OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "/Users/woodymacmini/.npm-global/bin/openclaw")
+
+# 通知文件路径 (供 OpenClaw 读取)
+NOTIFY_FILE = os.getenv("NOTIFY_FILE", "/Users/woodymacmini/LocalApp/OpenClaw/runtime_home/.openclaw/workspace/monitoring/notify.json")
+
+# 统计文件路径 (供早报汇总)
+STATS_FILE = os.getenv("STATS_FILE", "/Users/woodymacmini/LocalApp/OpenClaw/runtime_home/.openclaw/workspace/monitoring/daily_stats.json")
+IMESSAGE_TARGET = os.getenv("IMESSAGE_TARGET", "woodyterran@gmail.com")
+# 飞书通知目标 chat_id (p2p 会话)
+FEISHU_TARGET = os.getenv("FEISHU_TARGET", "oc_e8f5806f393d77eb4cc3b770f1b3e50b")
+OPENCLAW_DRY_RUN = os.getenv("OPENCLAW_DRY_RUN", "0") == "1"
+MONITOR_ONLY = os.getenv("MONITOR_ONLY", "0") == "1"
 
 # 日志设置
 logging.basicConfig(
@@ -141,14 +163,14 @@ class HyperliquidCopier:
 
         logger.info(f"目标地址: {TARGET_ADDRESS} | 跟单比例: {COPY_RATIO}")
 
-        # 初始化 SDK
-        self.info = Info(constants.MAINNET_API_URL, skip_ws=True)
-        
+        # 初始化 SDK (timeout=15 防止网络挂起)
+        self.info = Info(constants.MAINNET_API_URL, skip_ws=True, timeout=15)
+
         if self.is_dry_run:
             self.exchange = MockExchange(self.my_address)
         else:
             # 关键: Exchange 初始化时，如果使用 Agent 模式，需要传入主账户地址作为 account_address
-            self.exchange = Exchange(self.account, constants.MAINNET_API_URL, account_address=self.my_address)
+            self.exchange = Exchange(self.account, constants.MAINNET_API_URL, account_address=self.my_address, timeout=15)
 
         
         # 初始化 Spot Universe
@@ -178,12 +200,22 @@ class HyperliquidCopier:
         self.seen_oids = set()
         self.seen_fill_hashes = set()
         self.last_position_snapshot = {}
+        # 仓位防抖：上一轮目标仓位读数 (None 表示还没有任何快照)
+        # 用于过滤 Hyperliquid API 偶发的过期/不完整快照，防止"假平仓→重新开仓"对敲
+        self._prev_target_positions = None
         
         # 挂单指纹记录
         self.last_target_keys = None
+        # 挂单防抖：上一轮目标挂单指纹集合 (None 表示还没有快照)
+        # 要求连续两轮一致才执行全撤全挂，过滤 API 脏读导致的反复撤挂
+        self._prev_target_order_keys = None
 
         logger.info(f"跟单模式: {SYNC_MODE} ({'同步持仓' if SYNC_MODE == 'full' else '仅同步下单'})")
         logger.info(f"交易类型: {', '.join(MARKET_TYPES)}")
+        if COPY_COINS:
+            logger.info(f"币种白名单: {', '.join(sorted(COPY_COINS))}（仅跟单这些币种）")
+        else:
+            logger.info("币种白名单: 未设置（跟单所有币种）")
 
     def get_sz_decimals(self, coin):
         """获取币种数量精度"""
@@ -337,7 +369,32 @@ class HyperliquidCopier:
 
         target_positions = parse_positions(target_state)
         my_positions = parse_positions(my_state)
-        
+
+        # --- 仓位防抖：过滤目标仓位的"瞬时脏读" ---
+        # Hyperliquid API 偶尔会返回过期/不完整的仓位快照(多节点最终一致性)，
+        # 这类读数不会抛异常，会绕过 None 检查，直接据此交易会造成
+        # "假平仓→下轮重新开仓"的对敲亏损。
+        # 因此要求目标某币种的仓位连续两轮读数一致，才视为可信并据此调整。
+        prev_target = self._prev_target_positions
+        if prev_target is None:
+            # 第一次轮询：仅建立快照，本轮不据单次读数交易
+            self._prev_target_positions = dict(target_positions)
+            logger.info("仓位防抖：已建立首轮目标仓位快照，等待下轮确认后再同步")
+            return
+        confirmed_coins = set()
+        for coin in set(target_positions) | set(prev_target) | set(my_positions):
+            cur = target_positions.get(coin, 0.0)
+            old = prev_target.get(coin, 0.0)  # 上轮缺失视为 0
+            if abs(cur - old) < 1e-9:
+                confirmed_coins.add(coin)
+            else:
+                logger.warning(
+                    f"[{coin}] 目标仓位读数变化未确认 (上轮:{old} 本轮:{cur})，"
+                    f"疑似脏读，等待下轮确认，本轮跳过"
+                )
+        # 更新快照供下轮比对
+        self._prev_target_positions = dict(target_positions)
+
         # 模式2: 初始化基准
         if SYNC_MODE == 'order' and not self.initialized_baseline:
             self.target_baseline = target_positions.copy()
@@ -347,8 +404,15 @@ class HyperliquidCopier:
             return
 
         all_coins = set(target_positions.keys()) | set(my_positions.keys())
-        
+        # 币种白名单过滤：只处理白名单内的币种，白名单为空则不限制
+        if COPY_COINS:
+            all_coins = {c for c in all_coins if c.upper() in COPY_COINS}
+
         for coin in all_coins:
+            # 防抖：只对"连续两轮读数一致"的币种执行同步，过滤瞬时脏读
+            if coin not in confirmed_coins:
+                continue
+
             t_sz = target_positions.get(coin, 0.0)
             m_sz = my_positions.get(coin, 0.0)
             
@@ -361,6 +425,9 @@ class HyperliquidCopier:
                 t_base = self.target_baseline.get(coin, 0.0)
                 m_base = self.my_baseline.get(coin, 0.0)
                 t_delta = t_sz - t_base
+                # 目标没有变化，跳过——不干预用户自己的仓位
+                if abs(t_delta) < 0.0001:
+                    continue
                 target_goal = m_base + t_delta * COPY_RATIO
 
             # 计算需要调整的差额
@@ -402,7 +469,11 @@ class HyperliquidCopier:
         
         # --- 过滤逻辑 (Local) ---
         def is_allowed_order(o):
-            is_spot = self.is_spot_asset(o['coin'])
+            coin = o['coin']
+            # 币种白名单过滤
+            if COPY_COINS and coin.upper() not in COPY_COINS:
+                return False
+            is_spot = self.is_spot_asset(coin)
             if is_spot:
                 return SYNC_SPOT_ORDERS
             else:
@@ -420,19 +491,31 @@ class HyperliquidCopier:
             # logger.info(f"[DEBUG] 我的首个挂单: {my_orders[0]}")
         
         # 1. 构建指纹映射
-        # 指纹: (coin, side, price) -> 详情
+        # 指纹: (coin, side, price, sz) -> 详情
         def get_order_key(o):
-            return (o['coin'], o['side'], self.round_px(o['coin'], float(o['limitPx'])))
+            return (o['coin'], o['side'], self.round_px(o['coin'], float(o['limitPx'])), self.round_sz(o['coin'], float(o['sz'])))
 
         target_map = {get_order_key(o): o for o in target_orders}
         my_map = {get_order_key(o): o for o in my_orders}
         
         # 2. 检测变化 (基于目标挂单的指纹集合)
         current_target_keys = set(target_map.keys())
-        
+
+        # 防抖：目标挂单集合需连续两轮一致才执行同步，过滤 API 脏读导致的反复撤挂
+        prev_raw = self._prev_target_order_keys
+        self._prev_target_order_keys = current_target_keys
+        if prev_raw != current_target_keys:
+            # 尚未连续两轮一致（含首轮），等待下轮确认
+            if self.last_target_keys is not None:
+                logger.info(f"挂单读数变化未确认 (本轮 {len(current_target_keys)} 笔)，等待下轮确认，本轮跳过")
+            return
+
         # 如果是第一次运行，或者 target_keys 发生了变化，则执行同步
         if self.last_target_keys == current_target_keys:
             return
+
+        if self.last_target_keys is not None:
+            self.send_imessage_notification(target_orders)
 
         logger.info(f"检测到挂单变化，开始全量同步... (目标挂单数: {len(target_orders)})")
 
@@ -446,11 +529,13 @@ class HyperliquidCopier:
                     logger.info("撤单请求已发送")
                 else:
                     logger.error(f"撤单请求失败: {res}")
-                
+                    return  # 撤单失败，放弃本次同步，防止保证金不足
+
                 # 撤单后稍微等待，让 margin 释放生效
                 time.sleep(0.5)
             except Exception as e:
                 logger.error(f"撤单异常: {e}")
+                return  # 撤单异常，放弃本次同步，防止保证金不足
 
         # 4. 准备下单列表 (全部目标挂单)
         to_create = list(target_orders)
@@ -511,21 +596,187 @@ class HyperliquidCopier:
         # 更新状态指纹
         self.last_target_keys = current_target_keys
 
-    def update_history(self, target_state):
-        """更新历史记录到数据库"""
+    def monitor_open_orders(self, target_state):
+        target_orders = target_state.get('openOrders', [])
+
+        def is_allowed_order(o):
+            coin = o['coin']
+            # 币种白名单过滤
+            if COPY_COINS and coin.upper() not in COPY_COINS:
+                return False
+            is_spot = self.is_spot_asset(coin)
+            if is_spot:
+                return SYNC_SPOT_ORDERS
+            else:
+                return SYNC_PERP_ORDERS
+
+        target_orders = [o for o in target_orders if is_allowed_order(o)]
+
+        def get_order_key(o):
+            return (o['coin'], o['side'], self.round_px(o['coin'], float(o['limitPx'])), self.round_sz(o['coin'], float(o['sz'])))
+
+        current_target_keys = set(get_order_key(o) for o in target_orders)
+        if self.last_target_keys == current_target_keys:
+            return
+
+        if self.last_target_keys is not None:
+            added_keys = current_target_keys - self.last_target_keys
+            removed_keys = self.last_target_keys - current_target_keys
+            self.send_imessage_notification(target_orders, added_keys, removed_keys)
+
+        self.last_target_keys = current_target_keys
+
+    def _notify_env(self):
+        """构造 openclaw 子进程的环境变量，确保 PATH 包含 node"""
+        env = os.environ.copy()
+        extra_paths = ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin",
+                       os.path.expanduser("~/.npm-global/bin")]
+        current_path = env.get("PATH", "")
+        for p in extra_paths:
+            if p not in current_path:
+                current_path = p + ":" + current_path
+        env["PATH"] = current_path
+        return env
+
+    def send_feishu_text(self, text):
+        """通过 OpenClaw 发送飞书通知"""
+        if not text: return
+        try:
+            cmd = [OPENCLAW_BIN, "message", "send",
+                   "--channel", "feishu",
+                   "--target", FEISHU_TARGET,
+                   "--message", text]
+            if OPENCLAW_DRY_RUN:
+                cmd.append("--dry-run")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=self._notify_env())
+            if result.returncode == 0:
+                logger.info(f"飞书通知已发送: {text[:30]}...")
+            else:
+                logger.error(f"飞书通知发送失败 (code {result.returncode}): {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            logger.error("飞书通知发送超时 (30s)")
+        except Exception as e:
+            logger.error(f"发送飞书通知失败: {e}")
+
+    def send_imessage_text(self, text):
+        """通过 OpenClaw 发送通知：同时推送 iMessage 和飞书"""
+        if not text: return
+        self.send_feishu_text(text)
+        try:
+            cmd = [OPENCLAW_BIN, "message", "send",
+                   "--channel", "imessage",
+                   "--target", IMESSAGE_TARGET,
+                   "--message", text]
+            if OPENCLAW_DRY_RUN:
+                cmd.append("--dry-run")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=self._notify_env())
+            if result.returncode == 0:
+                logger.info(f"iMessage通知已发送: {text[:30]}...")
+            else:
+                logger.error(f"iMessage通知发送失败 (code {result.returncode}): {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            logger.error("iMessage通知发送超时 (30s)")
+        except Exception as e:
+            logger.error(f"发送iMessage失败: {e}")
+
+    def write_notify_file(self, change_type, detail):
+        """将变化写入通知文件，供 OpenClaw 读取"""
+        import json
+        try:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            record = {"time": timestamp, "type": change_type, "detail": detail}
+            
+            # 读取现有内容
+            existing = []
+            if os.path.exists(NOTIFY_FILE):
+                try:
+                    with open(NOTIFY_FILE, 'r') as f:
+                        existing = json.load(f)
+                except:
+                    existing = []
+            
+            # 追加新记录
+            existing.append(record)
+            
+            # 写回文件
+            with open(NOTIFY_FILE, 'w') as f:
+                json.dump(existing, f, ensure_ascii=False)
+                
+            logger.info(f"已写入通知文件: {change_type} - {detail}")
+            
+        except Exception as e:
+            logger.error(f"写入通知文件失败: {e}")
+    
+    def update_daily_stats(self, change_type):
+        """更新每日统计，供早报汇总使用"""
+        import json
+        try:
+            today = time.strftime("%Y-%m-%d")
+            
+            # 读取现有统计
+            stats = {"date": today, "trades": 0, "orders": 0}
+            if os.path.exists(STATS_FILE):
+                try:
+                    with open(STATS_FILE, 'r') as f:
+                        stats = json.load(f)
+                    # 新的一天，重置统计
+                    if stats.get("date") != today:
+                        stats = {"date": today, "trades": 0, "orders": 0}
+                except:
+                    stats = {"date": today, "trades": 0, "orders": 0}
+            
+            # 更新计数
+            if change_type == "trade":
+                stats["trades"] = stats.get("trades", 0) + 1
+            elif change_type == "order":
+                stats["orders"] = stats.get("orders", 0) + 1
+            
+            # 写回
+            with open(STATS_FILE, 'w') as f:
+                json.dump(stats, f, ensure_ascii=False)
+                
+        except Exception as e:
+            logger.error(f"更新每日统计失败: {e}")
+
+    def send_imessage_notification(self, target_orders, added_keys=None, removed_keys=None):
+        try:
+            ts = time.strftime("%H:%M:%S")
+            lines = [f"【挂单变动】{ts}"]
+
+            if removed_keys:
+                lines.append(f"❌ 取消 {len(removed_keys)} 笔:")
+                for key in list(removed_keys)[:3]:
+                    coin, side, px, sz = key
+                    lines.append(f"  {coin} {side} {sz}@{px}")
+
+            if added_keys:
+                lines.append(f"✅ 新增 {len(added_keys)} 笔:")
+                for key in list(added_keys)[:3]:
+                    coin, side, px, sz = key
+                    lines.append(f"  {coin} {side} {sz}@{px}")
+
+            lines.append(f"当前共 {len(target_orders)} 笔挂单")
+            self.send_imessage_text("\n".join(lines))
+
+        except Exception as e:
+            logger.error(f"构建挂单通知失败: {e}")
+
+    def update_history(self, target_state, notify=True):
+        """更新历史记录到数据库，并触发成交通知"""
         try:
             # 1. 记录挂单
-            # 注意: 这里只记录看到的 open orders。如果需要记录 cancel/fill，需要更复杂的逻辑或 stream。
-            # 目前只记录出现过的挂单 (oid 唯一)
             for o in target_state['openOrders']:
                 if o['oid'] not in self.seen_oids:
                     db.log_order(TARGET_ADDRESS, o)
                     self.seen_oids.add(o['oid'])
+                    # 仅在 notify=True 时才写入通知文件（避免初始化时发送旧通知）
+                    if notify:
+                        side_text = "卖出" if o['side'] == 'A' else "买入"
+                        self.write_notify_file("order", f"新挂单 {o['coin']} {side_text} {o['sz']}@{o['limitPx']}")
+                        # 更新每日统计
+                        self.update_daily_stats("order")
             
-            # 2. 记录持仓 (仅当发生变化时)
-            # 过滤掉 szi=0 的空仓位
-            # 注意: p 可能是 {'position': {...}} 结构，也可能是扁平结构(取决于构造方式)
-            # 统一取 core
+            # 2. 记录持仓
             current_positions = {}
             for p in target_state['assetPositions']:
                 core = p.get('position', p)
@@ -534,7 +785,6 @@ class HyperliquidCopier:
 
             for coin, pos in current_positions.items():
                 prev_pos = self.last_position_snapshot.get(coin)
-                # 检查是否发生变化 (数量或入场价)
                 is_changed = False
                 if not prev_pos:
                     is_changed = True
@@ -549,7 +799,6 @@ class HyperliquidCopier:
                     self.last_position_snapshot[coin] = pos.copy()
 
             # 3. 记录成交
-            # user_fills 接口获取最近成交
             fills = []
             max_retries = 3
             for i in range(max_retries):
@@ -558,40 +807,107 @@ class HyperliquidCopier:
                     break
                 except Exception as e:
                     if i == max_retries - 1:
-                        logger.warning(f"获取成交记录失败 (重试{max_retries}次后放弃): {e}")
+                        logger.warning(f"获取成交记录失败: {e}")
                     else:
                         time.sleep(1)
 
+            new_fills = []
             for fill in fills:
-                # 构建唯一标识，SDK 返回的 fill可能有 hash，也可能没有，用 tid+coin 兜底
-                # 注意: fill 结构可能随 SDK 版本变化，这里做一定容错
                 fill_hash = fill.get('hash') or f"{fill.get('tid')}_{fill.get('coin')}"
                 
                 if fill_hash not in self.seen_fill_hashes:
                     db.log_trade(TARGET_ADDRESS, fill)
                     self.seen_fill_hashes.add(fill_hash)
+                    new_fills.append(fill)
+            
+            # 发送成交通知 (仅当 notify=True 且有新成交时，且符合币种白名单)
+            if notify and new_fills:
+                for fill in new_fills:
+                    if COPY_COINS and fill['coin'].upper() not in COPY_COINS:
+                        continue
+                    ts = time.strftime("%H:%M:%S")
+                    side_text = "买入" if fill['side'] == 'A' else "卖出"
+                    msg = f"【成交变动】{ts}\n{fill['coin']} {side_text} {fill['sz']}@{fill['px']}"
+                    self.send_imessage_text(msg)
+                    # 写入通知文件供 OpenClaw 读取
+                    self.write_notify_file("trade", f"{fill['coin']} {side_text} {fill['sz']}@{fill['px']}")
+                    # 更新每日统计
+                    self.update_daily_stats("trade")
                     
         except Exception as e:
-            # 历史记录错误不应中断主流程
             logger.error(f"历史记录更新失败: {e}")
+
+    def init_history_cache(self):
+        """初始化历史缓存：DB 中已有的 fill 静默加载，停机期间漏掉的 fill 补发通知"""
+        logger.info("初始化历史数据缓存...")
+        try:
+            fills = []
+            try:
+                fills = self.info.user_fills(TARGET_ADDRESS)
+            except Exception as e:
+                logger.warning(f"初始化时获取成交失败: {e}")
+
+            missed_fills = []
+            for fill in fills:
+                fill_hash = fill.get('hash') or f"{fill.get('tid')}_{fill.get('coin')}"
+                self.seen_fill_hashes.add(fill_hash)
+                # 不在 DB 中 = 停机期间发生的新成交，需要补发通知
+                if not db.fill_exists_in_db(fill_hash):
+                    db.log_trade(TARGET_ADDRESS, fill)
+                    missed_fills.append(fill)
+
+            if missed_fills:
+                logger.info(f"检测到 {len(missed_fills)} 笔停机期间的漏报成交，补发通知")
+                for fill in missed_fills:
+                    fill_time = time.strftime("%m-%d %H:%M", time.localtime(fill['time'] / 1000))
+                    side_text = "买入" if fill['side'] == 'A' else "卖出"
+                    msg = f"【补发成交】{fill_time}\n{fill['coin']} {side_text} {fill['sz']}@{fill['px']}"
+                    self.send_imessage_text(msg)
+                    self.write_notify_file("trade", f"[补发]{fill['coin']} {side_text} {fill['sz']}@{fill['px']}")
+
+            # 初始化仓位/挂单快照（不发通知）
+            target_state = self.get_user_state(TARGET_ADDRESS)
+            if target_state:
+                self.update_history(target_state, notify=False)
+        except Exception as e:
+            logger.warning(f"初始化缓存失败: {e}")
 
     def run(self):
         logger.info("跟单程序已启动...")
+        if MONITOR_ONLY:
+            logger.info("运行模式: 仅监控通知")
+            
+        # 启动自检通知
+        try:
+            mode_str = "仅监控" if MONITOR_ONLY else "跟单模式"
+            self.send_imessage_text(f"【系统启动】{mode_str}已启动\n目标: {TARGET_ADDRESS[:6]}...")
+        except Exception as e:
+            logger.error(f"启动通知发送失败: {e}")
+            
+        # 启动前先初始化缓存
+        self.init_history_cache()
+        
         while True:
             try:
                 # 1. 获取目标状态
                 target_state = self.get_user_state(TARGET_ADDRESS)
                 
                 if target_state is None:
-                    logger.warning(f"获取目标状态失败 (可能由于网络或API限制)，跳过本次同步")
+                    logger.warning(f"获取目标状态失败，跳过本次同步")
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                # 更新历史记录
-                self.update_history(target_state)
+                # 无论什么模式，都更新历史并检查成交通知
+                self.update_history(target_state, notify=True)
+
+                if MONITOR_ONLY:
+                    self.monitor_open_orders(target_state)
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
                 # 2. 获取我的状态
                 my_state = self.get_user_state(self.my_address)
+
                 
                 if my_state is None:
                     logger.warning(f"获取我的状态失败 (可能由于网络或API限制)，跳过本次同步")
@@ -608,4 +924,27 @@ class HyperliquidCopier:
             time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    HyperliquidCopier().run()
+    # 用全局标志区分"用户主动停止"和"意外崩溃"
+    _graceful_stop = False
+
+    def _handle_sigterm(signum, frame):
+        global _graceful_stop
+        _graceful_stop = True
+        logger.info("收到停止信号 (SIGTERM)，正在退出...")
+        raise SystemExit(0)  # 中断内层 while True，触发外层 break
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    while not _graceful_stop:
+        try:
+            HyperliquidCopier().run()
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("收到退出信号，停止运行")
+            break
+        except Exception as e:
+            if _graceful_stop:
+                break
+            import traceback
+            logger.error(f"程序意外崩溃: {e}\n{traceback.format_exc()}")
+            logger.error("10秒后自动重启...")
+            time.sleep(10)
