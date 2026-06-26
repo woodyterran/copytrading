@@ -27,6 +27,10 @@ POLL_INTERVAL = int(os.getenv("AUTO_REFRESH_INTERVAL", "5"))
 # 仓位偏差阈值 (USD价值)
 POSITION_DIFF_THRESHOLD_USD = 10.0
 
+# 下市价单后的冷却期(秒)：期间不再重新评估该币种，
+# 等成交反映到账户快照，避免"我方读数滞后→重复下单→再反向平掉"的对敲
+POSITION_COOLDOWN_SEC = max(POLL_INTERVAL * 2, 6)
+
 # 允许的最大滑点 (默认 2%)
 SLIPPAGE = float(os.getenv("SLIPPAGE", "0.02"))
 
@@ -203,6 +207,8 @@ class HyperliquidCopier:
         # 仓位防抖：上一轮目标仓位读数 (None 表示还没有任何快照)
         # 用于过滤 Hyperliquid API 偶发的过期/不完整快照，防止"假平仓→重新开仓"对敲
         self._prev_target_positions = None
+        # 下单冷却：coin -> 最近一次市价单的时间戳，防止我方读数滞后导致重复下单
+        self._position_cooldown = {}
         
         # 挂单指纹记录
         self.last_target_keys = None
@@ -413,6 +419,12 @@ class HyperliquidCopier:
             if coin not in confirmed_coins:
                 continue
 
+            # 冷却：刚下过单的币种，等成交反映到快照前不重复评估，防止超买/超卖后反向对敲
+            last_trade_ts = self._position_cooldown.get(coin, 0)
+            if time.time() - last_trade_ts < POSITION_COOLDOWN_SEC:
+                logger.info(f"[{coin}] 处于下单冷却期，跳过本轮评估(等成交反映到账户)")
+                continue
+
             t_sz = target_positions.get(coin, 0.0)
             m_sz = my_positions.get(coin, 0.0)
             
@@ -454,6 +466,9 @@ class HyperliquidCopier:
 
                 try:
                     logger.info(f"[{coin}] 执行市价{'买入' if is_buy else '卖出'} {rounded_sz}")
+                    # 先置冷却时间戳：无论成交回报是否及时，都先冻结该币种一个冷却期，
+                    # 避免下轮因我方快照未更新而重复下单
+                    self._position_cooldown[coin] = time.time()
                     res = self.exchange.market_open(coin, is_buy, rounded_sz, current_price, SLIPPAGE)
                     if res['status'] == 'ok':
                         logger.info(f"[{coin}] 市价单成交")
