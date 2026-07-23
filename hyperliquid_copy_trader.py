@@ -31,6 +31,10 @@ POSITION_DIFF_THRESHOLD_USD = 10.0
 # 等成交反映到账户快照，避免"我方读数滞后→重复下单→再反向平掉"的对敲
 POSITION_COOLDOWN_SEC = max(POLL_INTERVAL * 2, 6)
 
+# 成交佐证容差：目标仓位快照的变化必须能被目标成交流解释(否则判定脏读)。
+# 采用相对 5% + 绝对下限，兼容分批成交与精度误差。
+POSITION_CORROBORATION_TOL = 1e-4
+
 # 允许的最大滑点 (默认 2%)
 SLIPPAGE = float(os.getenv("SLIPPAGE", "0.02"))
 
@@ -204,11 +208,13 @@ class HyperliquidCopier:
         self.seen_oids = set()
         self.seen_fill_hashes = set()
         self.last_position_snapshot = {}
-        # 仓位防抖：上一轮目标仓位读数 (None 表示还没有任何快照)
-        # 用于过滤 Hyperliquid API 偶发的过期/不完整快照，防止"假平仓→重新开仓"对敲
-        self._prev_target_positions = None
         # 下单冷却：coin -> 最近一次市价单的时间戳，防止我方读数滞后导致重复下单
         self._position_cooldown = {}
+        # 成交佐证：目标合约仓位只能由"成交(fill)"改变。用成交流校验快照变化，
+        # 识别 Hyperliquid 节点"持续返回过期仓位"的脏读(两轮确认挡不住持续性脏读)。
+        self._target_fill_net = {}        # coin -> 运行期间累计签名成交量(B=+, A=-)
+        self._confirmed_target_pos = {}   # coin -> 最近一次经成交佐证的目标仓位
+        self._confirmed_fill_net = {}     # coin -> 确认上述仓位时的成交流基准
         
         # 挂单指纹记录
         self.last_target_keys = None
@@ -362,6 +368,42 @@ class HyperliquidCopier:
         # Hyperliquid API 返回的 px 字符串通常已经是标准化的
         return float(px)
 
+    def _corroborated_target_size(self, coin, snap):
+        """用目标成交流佐证仓位快照的变化，过滤"持续性脏读"。
+
+        目标合约仓位只能因成交而改变。若快照相对上次"已佐证仓位"的变化量，
+        能被期间的目标成交流(_target_fill_net)解释，则采纳新快照并重新锚定；
+        否则判定为脏读，返回上次已佐证的仓位。
+
+        返回 (t_sz, seeded)：seeded=True 表示本币种首次见到、仅播种基准、本轮不应交易。
+        """
+        if coin not in self._confirmed_target_pos:
+            # 首次见到该币种：以快照播种基准，本轮不据单次读数交易
+            self._confirmed_target_pos[coin] = snap
+            self._confirmed_fill_net[coin] = self._target_fill_net.get(coin, 0.0)
+            logger.info(f"[{coin}] 建立目标仓位基准={snap}，待成交佐证后再跟随")
+            return snap, True
+
+        confirmed = self._confirmed_target_pos[coin]
+        observed_delta = snap - confirmed
+        if abs(observed_delta) < 1e-9:
+            return confirmed, False  # 快照无变化，按已确认值对齐(仍可修正我方漂移)
+
+        fills_delta = self._target_fill_net.get(coin, 0.0) - self._confirmed_fill_net[coin]
+        if abs(observed_delta - fills_delta) <= abs(observed_delta) * 0.05 + POSITION_CORROBORATION_TOL:
+            # 变化被目标成交佐证 → 采纳新快照并重新锚定(顺带消除长期漂移)
+            self._confirmed_target_pos[coin] = snap
+            self._confirmed_fill_net[coin] = self._target_fill_net.get(coin, 0.0)
+            logger.info(f"[{coin}] 目标仓位变化已被成交佐证: {confirmed} → {snap}")
+            return snap, False
+
+        # 变化无成交佐证 → 脏读，忽略快照，仍按上次确认值
+        logger.warning(
+            f"[{coin}] 目标仓位变化无成交佐证 (快照:{snap} 确认:{confirmed} "
+            f"成交流Δ:{fills_delta:.5f})，判定为脏读，忽略本次读数"
+        )
+        return confirmed, False
+
     def sync_positions(self, target_state, my_state):
         """同步仓位 (市价单修补)"""
         def parse_positions(state):
@@ -375,31 +417,6 @@ class HyperliquidCopier:
 
         target_positions = parse_positions(target_state)
         my_positions = parse_positions(my_state)
-
-        # --- 仓位防抖：过滤目标仓位的"瞬时脏读" ---
-        # Hyperliquid API 偶尔会返回过期/不完整的仓位快照(多节点最终一致性)，
-        # 这类读数不会抛异常，会绕过 None 检查，直接据此交易会造成
-        # "假平仓→下轮重新开仓"的对敲亏损。
-        # 因此要求目标某币种的仓位连续两轮读数一致，才视为可信并据此调整。
-        prev_target = self._prev_target_positions
-        if prev_target is None:
-            # 第一次轮询：仅建立快照，本轮不据单次读数交易
-            self._prev_target_positions = dict(target_positions)
-            logger.info("仓位防抖：已建立首轮目标仓位快照，等待下轮确认后再同步")
-            return
-        confirmed_coins = set()
-        for coin in set(target_positions) | set(prev_target) | set(my_positions):
-            cur = target_positions.get(coin, 0.0)
-            old = prev_target.get(coin, 0.0)  # 上轮缺失视为 0
-            if abs(cur - old) < 1e-9:
-                confirmed_coins.add(coin)
-            else:
-                logger.warning(
-                    f"[{coin}] 目标仓位读数变化未确认 (上轮:{old} 本轮:{cur})，"
-                    f"疑似脏读，等待下轮确认，本轮跳过"
-                )
-        # 更新快照供下轮比对
-        self._prev_target_positions = dict(target_positions)
 
         # 模式2: 初始化基准
         if SYNC_MODE == 'order' and not self.initialized_baseline:
@@ -415,17 +432,20 @@ class HyperliquidCopier:
             all_coins = {c for c in all_coins if c.upper() in COPY_COINS}
 
         for coin in all_coins:
-            # 防抖：只对"连续两轮读数一致"的币种执行同步，过滤瞬时脏读
-            if coin not in confirmed_coins:
-                continue
-
             # 冷却：刚下过单的币种，等成交反映到快照前不重复评估，防止超买/超卖后反向对敲
             last_trade_ts = self._position_cooldown.get(coin, 0)
             if time.time() - last_trade_ts < POSITION_COOLDOWN_SEC:
                 logger.info(f"[{coin}] 处于下单冷却期，跳过本轮评估(等成交反映到账户)")
                 continue
 
-            t_sz = target_positions.get(coin, 0.0)
+            snap = target_positions.get(coin, 0.0)
+
+            # 成交佐证：拒绝无成交支撑的仓位跳变(持续性脏读的唯一可靠防线)
+            t_sz, seeded = self._corroborated_target_size(coin, snap)
+            if seeded:
+                # 首次见到该币种：只播种基准，本轮不据单次读数交易
+                continue
+
             m_sz = my_positions.get(coin, 0.0)
             
             # 计算目标持仓量 (根据模式)
@@ -834,14 +854,20 @@ class HyperliquidCopier:
                     db.log_trade(TARGET_ADDRESS, fill)
                     self.seen_fill_hashes.add(fill_hash)
                     new_fills.append(fill)
-            
+                    # 累计目标成交流(供仓位佐证)：B=买入(+)，A=卖出(-)
+                    fcoin = fill['coin']
+                    if fcoin in self.spot_token_to_pair:
+                        fcoin = self.spot_token_to_pair[fcoin]
+                    signed = float(fill['sz']) if fill.get('side') == 'B' else -float(fill['sz'])
+                    self._target_fill_net[fcoin] = self._target_fill_net.get(fcoin, 0.0) + signed
+
             # 发送成交通知 (仅当 notify=True 且有新成交时，且符合币种白名单)
             if notify and new_fills:
                 for fill in new_fills:
                     if COPY_COINS and fill['coin'].upper() not in COPY_COINS:
                         continue
                     ts = time.strftime("%H:%M:%S")
-                    side_text = "买入" if fill['side'] == 'A' else "卖出"
+                    side_text = "买入" if fill['side'] == 'B' else "卖出"
                     msg = f"【成交变动】{ts}\n{fill['coin']} {side_text} {fill['sz']}@{fill['px']}"
                     self.send_imessage_text(msg)
                     # 写入通知文件供 OpenClaw 读取
@@ -875,7 +901,7 @@ class HyperliquidCopier:
                 logger.info(f"检测到 {len(missed_fills)} 笔停机期间的漏报成交，补发通知")
                 for fill in missed_fills:
                     fill_time = time.strftime("%m-%d %H:%M", time.localtime(fill['time'] / 1000))
-                    side_text = "买入" if fill['side'] == 'A' else "卖出"
+                    side_text = "买入" if fill['side'] == 'B' else "卖出"
                     msg = f"【补发成交】{fill_time}\n{fill['coin']} {side_text} {fill['sz']}@{fill['px']}"
                     self.send_imessage_text(msg)
                     self.write_notify_file("trade", f"[补发]{fill['coin']} {side_text} {fill['sz']}@{fill['px']}")
