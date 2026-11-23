@@ -4,6 +4,12 @@ import signal
 import subprocess
 import logging
 import math
+import queue
+import threading
+import hmac
+import hashlib
+import base64
+import requests
 from decimal import Decimal
 from dotenv import load_dotenv
 from eth_account import Account
@@ -12,6 +18,10 @@ from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 import database as db
+
+# 读取项目根目录 .env（如飞书 Webhook 配置）；override=False 保证启动器注入的
+# 环境变量(私钥、目标地址等来自 DB)优先级更高，不会被 .env 覆盖。
+load_dotenv(override=False)
 
 # --- 配置区域 ---
 
@@ -59,25 +69,107 @@ COPY_COINS = set(c.strip().upper() for c in _copy_coins_raw.split(",") if c.stri
 # 禁用代理以防止 ConnectionResetError
 os.environ['no_proxy'] = 'api.hyperliquid.xyz,api-ui.hyperliquid.xyz'
 
-OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "/Users/woodymacmini/.npm-global/bin/openclaw")
-
-# 通知文件路径 (供 OpenClaw 读取)
+# 通知文件路径 (本地落盘，供看板/早报等本地读取；不依赖任何外部服务)
 NOTIFY_FILE = os.getenv("NOTIFY_FILE", "/Users/woodymacmini/LocalApp/OpenClaw/runtime_home/.openclaw/workspace/monitoring/notify.json")
 
 # 统计文件路径 (供早报汇总)
 STATS_FILE = os.getenv("STATS_FILE", "/Users/woodymacmini/LocalApp/OpenClaw/runtime_home/.openclaw/workspace/monitoring/daily_stats.json")
-IMESSAGE_TARGET = os.getenv("IMESSAGE_TARGET", "woodyterran@gmail.com")
-# 飞书通知目标 chat_id (p2p 会话)
-FEISHU_TARGET = os.getenv("FEISHU_TARGET", "oc_e8f5806f393d77eb4cc3b770f1b3e50b")
-OPENCLAW_DRY_RUN = os.getenv("OPENCLAW_DRY_RUN", "0") == "1"
+
+# 飞书群机器人 Webhook：直连发送，不再经 OpenClaw。
+# 在飞书群里添加"自定义机器人"后拿到的推送地址；若开启了"签名校验"再填 SECRET。
+FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
+FEISHU_WEBHOOK_SECRET = os.getenv("FEISHU_WEBHOOK_SECRET", "").strip()
+
 MONITOR_ONLY = os.getenv("MONITOR_ONLY", "0") == "1"
 
+# 通知发送参数：通知在后台线程异步发送，绝不阻塞跟单主循环。
+# 单条通知子进程超时(秒)；通道连续失败 FAIL_THRESHOLD 次后熔断，暂停 SKIP_COOLDOWN 秒不再尝试。
+NOTIFY_SEND_TIMEOUT = int(os.getenv("NOTIFY_SEND_TIMEOUT", "15"))
+NOTIFY_FAIL_THRESHOLD = int(os.getenv("NOTIFY_FAIL_THRESHOLD", "3"))
+NOTIFY_SKIP_COOLDOWN = int(os.getenv("NOTIFY_SKIP_COOLDOWN", "300"))
+NOTIFY_QUEUE_MAX = int(os.getenv("NOTIFY_QUEUE_MAX", "200"))
+
+# 异常告警：某类健康检查连续失败达到该次数时发一条告警(进入异常态)，恢复时再发一条。
+# 期间不重复轰炸，避免断网等持续异常刷屏。
+ANOMALY_ALERT_AFTER = int(os.getenv("ANOMALY_ALERT_AFTER", "3"))
+# 跟单层错误(保证金不足/撤单失败/下单失败等)即时告警的去重冷却(秒)：同类错误该窗口内只发一次。
+TRADE_ALERT_COOLDOWN = int(os.getenv("TRADE_ALERT_COOLDOWN", "1800"))
+# 每天发送两账户对比表的整点(本地时间，逗号分隔)。
+REPORT_HOURS = [int(h) for h in os.getenv("REPORT_HOURS", "8,20").split(",") if h.strip()]
+
 # 日志设置
+# 级别可用环境变量 LOG_LEVEL 覆盖 (默认 INFO)；设为 DEBUG 可打开挂单检查等细粒度日志
+_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def feishu_sign(timestamp, secret):
+    """飞书自定义机器人"签名校验"：HMAC-SHA256(key=f"{ts}\\n{secret}") 后 base64。"""
+    string_to_sign = f"{timestamp}\n{secret}"
+    digest = hmac.new(string_to_sign.encode("utf-8"), b"", hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def feishu_post_sync(message, timeout=NOTIFY_SEND_TIMEOUT):
+    """同步直发飞书 Webhook(签名可选)。message 为含 msg_type 的消息体字典。
+
+    供类内发送与进程崩溃处理共用；崩溃场景下后台线程可能随进程一起消亡，
+    故崩溃告警走同步直发，best-effort。返回 (ok, detail)。
+    """
+    if not message or not FEISHU_WEBHOOK_URL:
+        return False, "未配置 FEISHU_WEBHOOK_URL 或消息为空"
+    payload = dict(message)
+    if FEISHU_WEBHOOK_SECRET:
+        ts = str(int(time.time()))
+        payload["timestamp"] = ts
+        payload["sign"] = feishu_sign(ts, FEISHU_WEBHOOK_SECRET)
+    try:
+        resp = requests.post(FEISHU_WEBHOOK_URL, json=payload, timeout=timeout)
+        data = {}
+        try:
+            data = resp.json()
+        except Exception:
+            pass
+        ret_code = data.get("code", data.get("StatusCode", -1))
+        if resp.status_code == 200 and ret_code == 0:
+            return True, "ok"
+        detail = data.get("msg") or data.get("StatusMessage") or resp.text[:150]
+        return False, f"HTTP {resp.status_code} code={ret_code} {detail}"
+    except requests.Timeout:
+        return False, f"超时({timeout}s)"
+    except Exception as e:
+        return False, str(e)
+
+
+def feishu_send_sync(text, timeout=NOTIFY_SEND_TIMEOUT):
+    """同步直发纯文本消息。"""
+    if not text:
+        return False, "消息为空"
+    return feishu_post_sync({"msg_type": "text", "content": {"text": text}}, timeout)
+
+
+def feishu_markdown_card(md_text, header_title=None, template="blue"):
+    """用 markdown 文本构造一张交互式卡片(schema 2.0，markdown 组件支持竖线表格)。"""
+    card = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "body": {"elements": [{"tag": "markdown", "content": md_text}]},
+    }
+    if header_title:
+        card["header"] = {
+            "title": {"tag": "plain_text", "content": header_title},
+            "template": template,
+        }
+    return card
+
+
+def feishu_send_card_sync(card, timeout=NOTIFY_SEND_TIMEOUT):
+    """同步直发交互式卡片。"""
+    return feishu_post_sync({"msg_type": "interactive", "card": card}, timeout)
 
 class MockExchange:
     """模拟交易所，用于无私钥模式下的模拟跟单"""
@@ -221,6 +313,28 @@ class HyperliquidCopier:
         # 挂单防抖：上一轮目标挂单指纹集合 (None 表示还没有快照)
         # 要求连续两轮一致才执行全撤全挂，过滤 API 脏读导致的反复撤挂
         self._prev_target_order_keys = None
+
+        # 通知后台发送：主循环只入队(非阻塞)，由守护线程串行发送飞书 Webhook，
+        # 通道故障不再卡住跟单。连续失败即熔断，暂停一段时间不再尝试。
+        self._notify_queue = queue.Queue(maxsize=NOTIFY_QUEUE_MAX)
+        self._chan_fail = {"feishu": 0}
+        self._chan_skip_until = {"feishu": 0.0}
+        self._notify_thread = threading.Thread(
+            target=self._notify_worker, name="notify-worker", daemon=True)
+        self._notify_thread.start()
+        # 本次启动是否已发过"运行正常"通知(首个成功周期后置 True，每次启动仅一条)
+        self._startup_notified = False
+        # 异常告警状态：key -> 连续失败次数；_alerted 记录已进入异常态(已发告警)的 key。
+        # 进入异常态发一条，恢复时发一条，期间不重复。
+        self._fail_counts = {}
+        self._alerted = set()
+        # 跟单层即时告警去重：key -> 上次发送时间戳，冷却期内同类不重复。
+        self._alert_last = {}
+
+        # 每天定时对比表：在 REPORT_HOURS 指定的整点各发一次两账户对比。
+        self._report_thread = threading.Thread(
+            target=self._report_scheduler, name="report-scheduler", daemon=True)
+        self._report_thread.start()
 
         logger.info(f"跟单模式: {SYNC_MODE} ({'同步持仓' if SYNC_MODE == 'full' else '仅同步下单'})")
         logger.info(f"交易类型: {', '.join(MARKET_TYPES)}")
@@ -494,8 +608,11 @@ class HyperliquidCopier:
                         logger.info(f"[{coin}] 市价单成交")
                     else:
                         logger.error(f"[{coin}] 下单失败: {res}")
+                        self._alert_now(f"mkt_fail_{coin}",
+                                        f"{coin} 市价单失败，未能跟上目标仓位: {str(res)[:150]}")
                 except Exception as e:
                     logger.error(f"[{coin}] 下单异常: {e}")
+                    self._alert_now(f"mkt_exc_{coin}", f"{coin} 市价下单异常: {e}")
 
     def sync_open_orders(self, target_state, my_state):
         """同步挂单 (新逻辑: 优先清理，高价优先挂单，保证金检查，支持过滤)"""
@@ -614,16 +731,26 @@ class HyperliquidCopier:
                         # 检查是否为 margin 相关错误
                         if 'Margin' in err_msg or 'balance' in err_msg.lower():
                             logger.warning("⚠️ 保证金不足，停止继续挂单")
+                            self._alert_now("margin",
+                                            f"保证金不足，挂单中止(部分目标挂单未能跟上): {err_msg[:120]}")
                             break
+                        else:
+                            self._alert_now(f"order_err_{coin}",
+                                            f"{coin} 挂单业务错误: {err_msg[:120]}")
                     else:
                         pass # 成功
                 else:
                     logger.error(f"挂单请求失败: {res}")
+                    self._alert_now("order_req_fail",
+                                    f"挂单请求失败: {str(res)[:150]}")
             except Exception as e:
                 logger.error(f"挂单异常: {e}")
                 if 'margin' in str(e).lower():
                     logger.warning("⚠️ 捕获保证金异常，停止继续挂单")
+                    self._alert_now("margin", f"保证金不足(异常)，挂单中止: {e}")
                     break
+                else:
+                    self._alert_now("order_exc", f"挂单异常: {e}")
             
             # 稍微间隔一下避免速率限制
             time.sleep(0.1)
@@ -773,7 +900,7 @@ class HyperliquidCopier:
         except Exception as e:
             logger.error(f"更新每日统计失败: {e}")
 
-    def send_imessage_notification(self, target_orders, added_keys=None, removed_keys=None):
+    def send_order_change_notification(self, target_orders, added_keys=None, removed_keys=None):
         try:
             ts = time.strftime("%H:%M:%S")
             lines = [f"【挂单变动】{ts}"]
@@ -791,7 +918,7 @@ class HyperliquidCopier:
                     lines.append(f"  {coin} {side} {sz}@{px}")
 
             lines.append(f"当前共 {len(target_orders)} 笔挂单")
-            self.send_imessage_text("\n".join(lines))
+            self.send_notification("\n".join(lines))
 
         except Exception as e:
             logger.error(f"构建挂单通知失败: {e}")
@@ -869,7 +996,7 @@ class HyperliquidCopier:
                     ts = time.strftime("%H:%M:%S")
                     side_text = "买入" if fill['side'] == 'B' else "卖出"
                     msg = f"【成交变动】{ts}\n{fill['coin']} {side_text} {fill['sz']}@{fill['px']}"
-                    self.send_imessage_text(msg)
+                    self.send_notification(msg)
                     # 写入通知文件供 OpenClaw 读取
                     self.write_notify_file("trade", f"{fill['coin']} {side_text} {fill['sz']}@{fill['px']}")
                     # 更新每日统计
@@ -903,7 +1030,7 @@ class HyperliquidCopier:
                     fill_time = time.strftime("%m-%d %H:%M", time.localtime(fill['time'] / 1000))
                     side_text = "买入" if fill['side'] == 'B' else "卖出"
                     msg = f"【补发成交】{fill_time}\n{fill['coin']} {side_text} {fill['sz']}@{fill['px']}"
-                    self.send_imessage_text(msg)
+                    self.send_notification(msg)
                     self.write_notify_file("trade", f"[补发]{fill['coin']} {side_text} {fill['sz']}@{fill['px']}")
 
             # 初始化仓位/挂单快照（不发通知）
@@ -913,55 +1040,233 @@ class HyperliquidCopier:
         except Exception as e:
             logger.warning(f"初始化缓存失败: {e}")
 
+    def _notify_startup_ok(self):
+        """进程启动后，首个成功周期完成时发一次"运行正常"通知(每进程/每次启动仅一次)。
+
+        放在成功获取到目标状态并走完一轮(监控或同步)之后，确保通知代表"已正常运行"，
+        而不是进程刚拉起、此刻 API 可能还连不上的"已启动"。
+        """
+        if getattr(self, "_startup_notified", False):
+            return
+        self._startup_notified = True
+        mode_str = "仅监控" if MONITOR_ONLY else "跟单模式"
+        coins = ",".join(sorted(COPY_COINS)) if COPY_COINS else "全部"
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.send_notification(
+            f"【运行正常】{mode_str}已启动并正常运行\n"
+            f"时间: {ts}\n"
+            f"目标: {TARGET_ADDRESS[:6]}...{TARGET_ADDRESS[-4:]}\n"
+            f"币种: {coins} | 跟单比例: {COPY_RATIO}")
+
+    def _note_failure(self, key, label):
+        """记录一次某类健康检查失败；连续达到阈值且尚未告警时，立即发一条异常告警。"""
+        n = self._fail_counts.get(key, 0) + 1
+        self._fail_counts[key] = n
+        if n >= ANOMALY_ALERT_AFTER and key not in self._alerted:
+            self._alerted.add(key)
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.send_notification(f"⚠️【运行异常】{ts}\n{label}\n(已连续 {n} 次)")
+
+    def _note_recovery(self, key, label):
+        """某类健康检查成功；若此前处于异常态，发一条恢复通知并清零计数。"""
+        was_alerted = key in self._alerted
+        if self._fail_counts.get(key, 0) or was_alerted:
+            self._fail_counts[key] = 0
+            self._alerted.discard(key)
+            if was_alerted:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                self.send_notification(f"✅【已恢复】{ts}\n{label}")
+
+    def _alert_now(self, key, text, cooldown=TRADE_ALERT_COOLDOWN):
+        """跟单层错误即时告警：首次立即发，cooldown 秒内同 key 不重复(防持续错误刷屏)。"""
+        now = time.time()
+        if now - self._alert_last.get(key, 0.0) < cooldown:
+            return
+        self._alert_last[key] = now
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.send_notification(f"⚠️【跟单异常】{ts}\n{text}")
+
+    # ---------- 每天定时两账户对比表 ----------
+    def _seconds_until_next_report(self):
+        import datetime
+        now = datetime.datetime.now()
+        cands = []
+        for h in REPORT_HOURS:
+            t = now.replace(hour=h, minute=0, second=0, microsecond=0)
+            if t <= now:
+                t += datetime.timedelta(days=1)
+            cands.append(t)
+        if not cands:
+            return 3600.0
+        return max(1.0, (min(cands) - now).total_seconds())
+
+    def _report_scheduler(self):
+        """守护线程：在 REPORT_HOURS 指定整点各发一次两账户对比表。"""
+        if not REPORT_HOURS:
+            return
+        while True:
+            try:
+                time.sleep(self._seconds_until_next_report())
+                self.send_account_comparison()
+                time.sleep(61)  # 越过触发分钟，避免同一整点重复触发
+            except Exception as e:
+                logger.error(f"定时对比表任务异常: {e}")
+                time.sleep(60)
+
+    def _fetch_report_snapshot(self, address):
+        """抓取单账户快照：账户权益 + 合约持仓 + 挂单。失败返回 None。"""
+        try:
+            us = self.info.user_state(address)
+        except Exception as e:
+            logger.error(f"对比表获取账户状态失败 {address}: {e}")
+            return None
+        try:
+            orders = self.info.open_orders(address)
+        except Exception as e:
+            logger.warning(f"对比表获取挂单失败 {address}: {e}")
+            orders = []
+        try:
+            acct_value = float(us.get("marginSummary", {}).get("accountValue", 0) or 0)
+        except Exception:
+            acct_value = 0.0
+        positions = {}
+        for p in us.get("assetPositions", []):
+            core = p.get("position", p)
+            szi = float(core.get("szi", 0) or 0)
+            if szi == 0:
+                continue
+            positions[core["coin"]] = {
+                "szi": szi,
+                "entry": float(core.get("entryPx") or 0),
+                "value": float(core.get("positionValue") or 0),
+                "upnl": float(core.get("unrealizedPnl") or 0),
+            }
+        order_counts = {}
+        for o in orders:
+            order_counts[o["coin"]] = order_counts.get(o["coin"], 0) + 1
+        return {"acct_value": acct_value, "positions": positions,
+                "order_counts": order_counts, "order_total": len(orders)}
+
+    @staticmethod
+    def _fmt_usd(v):
+        return f"${v:,.2f}"
+
+    @staticmethod
+    def _fmt_num(v, nd=4):
+        s = f"{v:.{nd}f}"
+        return s.rstrip("0").rstrip(".") if "." in s else s
+
+    def build_account_comparison_md(self):
+        """构建两账户(目标 vs 我方)对比的 Markdown(含竖线表格)；抓取失败返回 None。"""
+        tgt = self._fetch_report_snapshot(TARGET_ADDRESS)
+        mine = self._fetch_report_snapshot(self.my_address)
+        if tgt is None or mine is None:
+            return None
+        ts = time.strftime("%Y-%m-%d %H:%M")
+        md = []
+        md.append(f"**🎯目标** `{TARGET_ADDRESS[:6]}...{TARGET_ADDRESS[-4:]}`　"
+                  f"**👤我方** `{self.my_address[:6]}...{self.my_address[-4:]}`")
+        md.append("")
+        # 账户权益
+        md.append("**💰 账户权益**")
+        md.append("| 账户 | 权益 |")
+        md.append("| :-- | --: |")
+        md.append(f"| 🎯目标 | {self._fmt_usd(tgt['acct_value'])} |")
+        md.append(f"| 👤我方 | {self._fmt_usd(mine['acct_value'])} |")
+        md.append("")
+        # 持仓
+        coins = sorted(set(tgt['positions']) | set(mine['positions']))
+        md.append("**📈 持仓对比**")
+        if not coins:
+            md.append("_两账户均无持仓_")
+        else:
+            md.append("| 账户 | 数量 | 均价 | 市值 | 浮盈 | 币种 | 方向 |")
+            md.append("| :-- | --: | --: | --: | --: | :-- | :-: |")
+            for c in coins:
+                for tag, snap in (("🎯", tgt['positions'].get(c)),
+                                  ("👤", mine['positions'].get(c))):
+                    if not snap:
+                        md.append(f"| {tag} | - | - | - | - | {c} | - |")
+                        continue
+                    side = "多" if snap['szi'] > 0 else "空"
+                    md.append(
+                        f"| {tag} | {self._fmt_num(abs(snap['szi']))} | "
+                        f"{self._fmt_num(snap['entry'], 2)} | {self._fmt_usd(snap['value'])} | "
+                        f"{snap['upnl']:+,.2f} | {c} | {side} |")
+        md.append("")
+        # 挂单
+        ocoins = sorted(set(tgt['order_counts']) | set(mine['order_counts']))
+        md.append("**📋 挂单对比**")
+        md.append("| 币种 | 🎯目标 | 👤我方 |")
+        md.append("| :-- | --: | --: |")
+        for c in ocoins:
+            md.append(f"| {c} | {tgt['order_counts'].get(c, 0)} | {mine['order_counts'].get(c, 0)} |")
+        md.append(f"| **合计** | **{tgt['order_total']}** | **{mine['order_total']}** |")
+        return "\n".join(md)
+
+    def send_account_comparison(self):
+        """生成并发送两账户对比表(交互式卡片 + Markdown 表格，走异步队列)。"""
+        md = self.build_account_comparison_md()
+        if md:
+            title = f"📊 账户对比 {time.strftime('%Y-%m-%d %H:%M')}"
+            self.send_card(feishu_markdown_card(md, header_title=title), label="账户对比表")
+            logger.info("已发送两账户对比表")
+        else:
+            logger.warning("对比表生成失败(账户状态抓取失败)，本次跳过")
+            self._alert_now("report_fail", "两账户对比表生成失败：账户状态抓取失败")
+
     def run(self):
         logger.info("跟单程序已启动...")
         if MONITOR_ONLY:
             logger.info("运行模式: 仅监控通知")
-            
-        # 启动自检通知
-        try:
-            mode_str = "仅监控" if MONITOR_ONLY else "跟单模式"
-            self.send_imessage_text(f"【系统启动】{mode_str}已启动\n目标: {TARGET_ADDRESS[:6]}...")
-        except Exception as e:
-            logger.error(f"启动通知发送失败: {e}")
-            
+
         # 启动前先初始化缓存
         self.init_history_cache()
-        
+
         while True:
             try:
                 # 1. 获取目标状态
                 target_state = self.get_user_state(TARGET_ADDRESS)
-                
+
                 if target_state is None:
                     logger.warning(f"获取目标状态失败，跳过本次同步")
+                    self._note_failure("target_state", "持续获取目标状态失败（网络/API 异常），已暂停同步")
                     time.sleep(POLL_INTERVAL)
                     continue
+                self._note_recovery("target_state", "目标状态获取已恢复正常，同步继续")
 
                 # 无论什么模式，都更新历史并检查成交通知
                 self.update_history(target_state, notify=True)
 
                 if MONITOR_ONLY:
                     self.monitor_open_orders(target_state)
+                    self._note_recovery("loop", "轮询循环已恢复正常")
+                    self._notify_startup_ok()  # 首个成功周期后发一次"运行正常"
                     time.sleep(POLL_INTERVAL)
                     continue
 
                 # 2. 获取我的状态
                 my_state = self.get_user_state(self.my_address)
 
-                
+
                 if my_state is None:
                     logger.warning(f"获取我的状态失败 (可能由于网络或API限制)，跳过本次同步")
+                    self._note_failure("my_state", "持续获取我的账户状态失败（网络/API 异常），已暂停同步")
                     time.sleep(POLL_INTERVAL)
                     continue
-                
+                self._note_recovery("my_state", "我的账户状态获取已恢复正常，同步继续")
+
                 # 3. 执行同步
                 self.sync_positions(target_state, my_state)
                 self.sync_open_orders(target_state, my_state)
-                
+
+                self._note_recovery("loop", "轮询循环已恢复正常")
+                self._notify_startup_ok()  # 首个成功周期后发一次"运行正常"
+
             except Exception as e:
                 logger.error(f"轮询出错: {e}")
-            
+                self._note_failure("loop", f"轮询循环抛出异常: {e}")
+
             time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
@@ -988,4 +1293,13 @@ if __name__ == "__main__":
             import traceback
             logger.error(f"程序意外崩溃: {e}\n{traceback.format_exc()}")
             logger.error("10秒后自动重启...")
+            # 崩溃立即告警(同步直发：后台通知线程已随实例消亡)
+            try:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                ok, detail = feishu_send_sync(
+                    f"🛑【程序崩溃】{ts}\n{e}\n10 秒后自动重启...")
+                if not ok:
+                    logger.error(f"崩溃告警发送失败: {detail}")
+            except Exception as ne:
+                logger.error(f"崩溃告警发送异常: {ne}")
             time.sleep(10)
