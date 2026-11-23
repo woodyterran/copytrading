@@ -12,6 +12,17 @@ history.db
 # Logs and runtime files
 *.log
 *.pid
+# 轮转归档日志 / 看门狗锁 / 运行时状态 / 飞书机器人本地关停开关
+*.log.*.gz
+.watchdog.lock
+.last_bot_log
+.feishu_bot.off
+
+# 杂项/备份/空库文件(本地运行产生, 不入库)
+app_backup.py
+data.db
+db.sqlite
+hyper.db
 
 # Python cache
 __pycache__/

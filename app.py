@@ -30,10 +30,11 @@ SCRIPT_PATH = os.path.join(BASE_DIR, 'hyperliquid_copy_trader.py')
 db.init_db()
 
 # @st.cache_resource
-def get_cookie_manager():
-    return stx.CookieManager()
+# def get_cookie_manager():
+#     return stx.CookieManager()
 
-cookie_manager = get_cookie_manager()
+# cookie_manager = get_cookie_manager()
+cookie_manager = None
 
 # --- 用户隔离辅助函数 ---
 def get_user_files(email):
@@ -42,7 +43,9 @@ def get_user_files(email):
     email_hash = hashlib.md5(email.encode()).hexdigest()
     return {
         'pid': os.path.join(BASE_DIR, f'bot_{email_hash}.pid'),
-        'log': os.path.join(BASE_DIR, f'bot_{email_hash}.log')
+        'log': os.path.join(BASE_DIR, f'bot_{email_hash}.log'),
+        'monitor_pid': os.path.join(BASE_DIR, f'monitor_{email_hash}.pid'),
+        'monitor_log': os.path.join(BASE_DIR, f'monitor_{email_hash}.log')
     }
 
 def get_bot_pid(pid_file):
@@ -76,10 +79,10 @@ def sidebar_logic():
         
         # --- 登出按钮 ---
         if st.sidebar.button("登出"):
-            try:
-                cookie_manager.delete('user_email', key="del_email")
-            except KeyError:
-                pass # Cookie already deleted or not found
+            # try:
+            #     cookie_manager.delete('user_email', key="del_email")
+            # except KeyError:
+            #     pass # Cookie already deleted or not found
                 
             if 'user_email' in st.session_state:
                 del st.session_state['user_email']
@@ -133,6 +136,12 @@ def sidebar_logic():
                 help="同步持仓: 初始时将仓位调整至目标一致。\n仅同步下单: 初始不调整仓位，仅跟随后续的挂单和市价单。"
             )
 
+            copy_coins = st.text_input(
+                '跟单币种白名单',
+                value=user_config.get('copy_coins', ''),
+                help="只跟单指定币种，多个用英文逗号分隔（如 BTC,ETH）。留空表示跟单所有币种。"
+            )
+
             st.markdown("#### 挂单同步选项")
             sync_perp_orders = st.checkbox('同步合约挂单', value=bool(user_config.get('sync_perp_orders', True)))
             sync_spot_orders = st.checkbox('同步现货挂单', value=bool(user_config.get('sync_spot_orders', False)))
@@ -144,7 +153,7 @@ def sidebar_logic():
             if submitted:
                 # 将列表转换为逗号分隔的字符串
                 market_type_str = ",".join(market_types)
-                db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type=market_type_str, my_address=my_address, sync_perp_orders=sync_perp_orders, sync_spot_orders=sync_spot_orders)
+                db.save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type=market_type_str, my_address=my_address, sync_perp_orders=sync_perp_orders, sync_spot_orders=sync_spot_orders, copy_coins=copy_coins.strip())
                 st.sidebar.success('✅配置已保存')
 
         st.sidebar.divider()
@@ -154,9 +163,13 @@ def sidebar_logic():
         user_files = get_user_files(email)
         PID_FILE = user_files['pid']
         LOG_FILE = user_files['log']
+        MONITOR_PID_FILE = user_files['monitor_pid']
+        MONITOR_LOG_FILE = user_files['monitor_log']
         
         pid = get_bot_pid(PID_FILE)
         is_running = pid is not None
+        monitor_pid = get_bot_pid(MONITOR_PID_FILE)
+        is_monitor_running = monitor_pid is not None
         
         if is_running:
             st.sidebar.success(f'🟢 运行中 (PID: {pid})')
@@ -186,14 +199,58 @@ def sidebar_logic():
                     env['MY_ADDRESS'] = str(cfg.get('my_address', ''))
                     env['SYNC_PERP_ORDERS'] = '1' if cfg.get('sync_perp_orders', True) else '0'
                     env['SYNC_SPOT_ORDERS'] = '1' if cfg.get('sync_spot_orders', False) else '0'
-                    
+                    env['COPY_COINS'] = str(cfg.get('copy_coins', ''))
+
                     with open(LOG_FILE, 'a') as log_f:
                         proc = subprocess.Popen(
                             [sys.executable, '-u', SCRIPT_PATH],
-                            stdout=log_f, stderr=log_f, cwd=BASE_DIR, env=env
+                            stdout=log_f, stderr=log_f, cwd=BASE_DIR, env=env,
+                            start_new_session=True  # 独立 session，防止 Streamlit 退出/重启时 SIGHUP 杀死 bot
                         )
                     with open(PID_FILE, 'w') as f: f.write(str(proc.pid))
                     st.rerun()
+
+        st.sidebar.divider()
+        st.sidebar.subheader('🔔 监控通知（不跟单）')
+
+        if is_monitor_running:
+            st.sidebar.success(f'🟢 监控中 (PID: {monitor_pid})')
+            if st.sidebar.button('🔴 停止监控'):
+                try:
+                    os.kill(monitor_pid, signal.SIGTERM)
+                    if os.path.exists(MONITOR_PID_FILE): os.remove(MONITOR_PID_FILE)
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f'停止失败: {e}')
+        else:
+            st.sidebar.warning('⚪ 未监控')
+            if st.sidebar.button('🟢 启动监控'):
+                if is_running:
+                    st.sidebar.error("机器人运行中：为避免重复通知，请先停止机器人")
+                else:
+                    cfg = db.get_user_config(email)
+                    if not cfg:
+                        st.sidebar.error("请先保存配置")
+                    else:
+                        env = os.environ.copy()
+                        env['MY_PRIVATE_KEY'] = ""
+                        env['TARGET_ADDRESS'] = cfg['target_address']
+                        env['AUTO_REFRESH_INTERVAL'] = str(cfg.get('auto_refresh_interval', 10))
+                        env['MARKET_TYPE'] = str(cfg.get('market_type', 'perps'))
+                        env['SYNC_PERP_ORDERS'] = '1' if cfg.get('sync_perp_orders', True) else '0'
+                        env['SYNC_SPOT_ORDERS'] = '1' if cfg.get('sync_spot_orders', False) else '0'
+                        env['COPY_COINS'] = str(cfg.get('copy_coins', ''))
+                        env['MONITOR_ONLY'] = '1'
+
+                        with open(MONITOR_LOG_FILE, 'a') as log_f:
+                            proc = subprocess.Popen(
+                                [sys.executable, '-u', SCRIPT_PATH],
+                                stdout=log_f, stderr=log_f, cwd=BASE_DIR, env=env,
+                                start_new_session=True  # 独立 session，防止 Streamlit 退出/重启时 SIGHUP 杀死 bot
+                            )
+                        with open(MONITOR_PID_FILE, 'w') as f:
+                            f.write(str(proc.pid))
+                        st.rerun()
                     
         # --- 修改密码 ---
         with st.sidebar.expander("🔑 修改管理员密码"):
@@ -217,10 +274,10 @@ def sidebar_logic():
                         db.set_admin_password(new_pwd)
                         st.success("密码修改成功！请重新登录。")
                         # 登出
-                        try:
-                            cookie_manager.delete('user_email', key="del_email_chpwd")
-                        except KeyError:
-                            pass # Cookie already deleted or not found
+                        # try:
+                        #     cookie_manager.delete('user_email', key="del_email_chpwd")
+                        # except KeyError:
+                        #     pass # Cookie already deleted or not found
                             
                         if 'user_email' in st.session_state:
                             del st.session_state['user_email']
@@ -245,25 +302,12 @@ def sidebar_logic():
                         
                     expires_at = datetime.now() + timedelta(days=30)
                     user_email = DEFAULT_USER_EMAIL
-                    cookie_manager.set('user_email', user_email, key="set_pwd_email", expires_at=expires_at)
+                    # cookie_manager.set('user_email', user_email, key="set_pwd_email", expires_at=expires_at)
                     st.session_state['user_email'] = user_email
                     st.session_state['user_name'] = "Admin"
                     st.rerun()
                 else:
                     st.error("密码错误")
-
-# --- 辅助函数 ---
-def retry_api_call(func, *args, retries=3, delay=1, **kwargs):
-    """带重试机制的 API 调用 helper"""
-    last_exception = None
-    for i in range(retries):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            last_exception = e
-            if i < retries - 1:
-                time.sleep(delay)
-    raise last_exception
 
 # --- 主内容区域 (公开数据) ---
 def main_content():
@@ -304,12 +348,12 @@ def main_content():
     if current_target:
         try:
             info = get_hl_info()
-            # 获取用户状态 (包含持仓) - 增加重试
-            user_state = retry_api_call(info.user_state, current_target)
+            # 获取用户状态 (包含持仓)
+            user_state = info.user_state(current_target)
             
-            # 显式获取挂单 - 增加重试
+            # 显式获取挂单
             try:
-                raw_open_orders = retry_api_call(info.open_orders, current_target)
+                raw_open_orders = info.open_orders(current_target)
             except Exception as e_orders:
                 raw_open_orders = []
                 # st.warning(f"获取挂单失败: {e_orders}") # 保持界面整洁，忽略非关键错误
@@ -368,7 +412,7 @@ def main_content():
             with tab_trades:
                 try:
                     # 注意: user_fills 对于非本人地址可能返回空或报错，视 API 权限而定
-                    fills = retry_api_call(info.user_fills, current_target)
+                    fills = info.user_fills(current_target)
                     if fills:
                         df_fills = pd.DataFrame(fills)
                         df_fills['price'] = df_fills['px'].astype(float)
@@ -499,6 +543,9 @@ def main_content():
 
 @st.cache_resource
 def get_hl_info():
+    # 明确不使用系统代理，防止 Connection Reset 问题
+    import os
+    os.environ['no_proxy'] = 'api.hyperliquid.xyz,api-ui.hyperliquid.xyz'
     return Info(constants.MAINNET_API_URL, skip_ws=True)
 
 def format_time_with_label(dt_series):
@@ -537,9 +584,10 @@ def format_time_with_label(dt_series):
 
 # 检查 Cookie 是否存在已登录用户
 if 'user_email' not in st.session_state:
-    cookie_email = cookie_manager.get('user_email')
-    if cookie_email:
-        st.session_state['user_email'] = cookie_email
+    # cookie_email = cookie_manager.get('user_email')
+    # if cookie_email:
+    #     st.session_state['user_email'] = cookie_email
+    pass
 
 sidebar_logic()
 main_content()

@@ -55,6 +55,12 @@ def init_db():
         c.execute('ALTER TABLE users ADD COLUMN sync_spot_orders INTEGER DEFAULT 0')
     except sqlite3.OperationalError:
         pass # 列已存在
+
+    # 尝试添加 copy_coins 列（如果不存在）
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN copy_coins TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass # 列已存在
         
     # --- 全局设置表 ---
     c.execute('''
@@ -179,6 +185,18 @@ def log_trade(target_address, trade):
     finally:
         conn.close()
 
+def fill_exists_in_db(fill_hash):
+    """检查某个 fill 是否已在 DB 中（用于区分停机期间漏掉的成交）"""
+    conn = sqlite3.connect(HISTORY_DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute('SELECT 1 FROM history_trades WHERE hash = ?', (fill_hash,))
+        return c.fetchone() is not None
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
 def log_position(target_address, position):
     """记录持仓 (通常只在变化时调用)"""
     conn = sqlite3.connect(HISTORY_DB_FILE)
@@ -194,7 +212,7 @@ def log_position(target_address, position):
             position['coin'],
             float(position['szi']),
             float(position.get('entryPx', 0)),
-            float(position.get('leverage', 0) if position.get('leverage') else 0), # leverage dict check
+            float(position.get('leverage', {}).get('value', 0) if isinstance(position.get('leverage'), dict) else float(position.get('leverage', 0))),
             datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         ))
         conn.commit()
@@ -223,7 +241,7 @@ def get_history_csv():
 def get_user_config(email):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, sync_perp_orders, sync_spot_orders FROM users WHERE email = ?', (email,))
+    c.execute('SELECT private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, sync_perp_orders, sync_spot_orders, copy_coins FROM users WHERE email = ?', (email,))
     row = c.fetchone()
     conn.close()
     if row:
@@ -237,17 +255,18 @@ def get_user_config(email):
             'market_type': row[6] if len(row) > 6 else 'perps',
             'my_address': row[7] if len(row) > 7 else '',
             'sync_perp_orders': bool(row[8]) if len(row) > 8 else True,
-            'sync_spot_orders': bool(row[9]) if len(row) > 9 else False
+            'sync_spot_orders': bool(row[9]) if len(row) > 9 else False,
+            'copy_coins': row[10] if len(row) > 10 else ''
         }
     return None
 
-def save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode='full', auto_refresh_interval=10, market_type='perps', my_address='', sync_perp_orders=True, sync_spot_orders=False):
+def save_user_config(email, private_key, target_address, copy_ratio, slippage, sync_mode='full', auto_refresh_interval=10, market_type='perps', my_address='', sync_perp_orders=True, sync_spot_orders=False, copy_coins=''):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        INSERT OR REPLACE INTO users (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, sync_perp_orders, sync_spot_orders)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, int(sync_perp_orders), int(sync_spot_orders)))
+        INSERT OR REPLACE INTO users (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, sync_perp_orders, sync_spot_orders, copy_coins)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (email, private_key, target_address, copy_ratio, slippage, sync_mode, auto_refresh_interval, market_type, my_address, int(sync_perp_orders), int(sync_spot_orders), copy_coins))
     conn.commit()
     conn.close()
 

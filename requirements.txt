@@ -78,3 +78,4 @@ tzdata
 urllib3
 websocket-client
 Werkzeug
+lark-oapi
