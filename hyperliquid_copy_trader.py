@@ -322,7 +322,7 @@ class HyperliquidCopier:
         try:
             orders = self.info.open_orders(address)
             if address == self.my_address:
-                logger.info(f"[DEBUG] 原始挂单获取: {len(orders)} 个 | 地址: {address}")
+                logger.debug(f"原始挂单获取: {len(orders)} 个 | 地址: {address}")
                 
             filtered_orders = []
             for o in orders:
@@ -341,7 +341,7 @@ class HyperliquidCopier:
                 is_spot = self.is_spot_asset(o['coin'])
                 
                 if address == self.my_address:
-                    logger.info(f"[DEBUG] 挂单检查: {original_coin} -> {o['coin']} | IsSpot: {is_spot} | MarketTypes: {MARKET_TYPES}")
+                    logger.debug(f"挂单检查: {original_coin} -> {o['coin']} | IsSpot: {is_spot} | MarketTypes: {MARKET_TYPES}")
                 
                 if 'spot' in MARKET_TYPES and is_spot:
                     filtered_orders.append(o)
