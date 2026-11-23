@@ -642,16 +642,26 @@ class HyperliquidCopier:
             pass
             # logger.info(f"[DEBUG] 我的首个挂单: {my_orders[0]}")
         
-        # 1. 构建指纹映射
-        # 指纹: (coin, side, price, sz) -> 详情
-        def get_order_key(o):
-            return (o['coin'], o['side'], self.round_px(o['coin'], float(o['limitPx'])), self.round_sz(o['coin'], float(o['sz'])))
+        # 1. 构建指纹
+        #   目标指纹(目标自身数量): 用于防抖与变化检测
+        #   期望指纹(目标数量×跟单比例): 我方挂单"应有的样子"，与我方现有挂单做增量对比
+        def target_key(o):
+            return (o['coin'], o['side'],
+                    self.round_px(o['coin'], float(o['limitPx'])),
+                    self.round_sz(o['coin'], float(o['sz'])))
 
-        target_map = {get_order_key(o): o for o in target_orders}
-        my_map = {get_order_key(o): o for o in my_orders}
-        
+        def desired_key(o):
+            return (o['coin'], o['side'],
+                    self.round_px(o['coin'], float(o['limitPx'])),
+                    self.round_sz(o['coin'], float(o['sz']) * COPY_RATIO))
+
+        def my_key(o):
+            return (o['coin'], o['side'],
+                    self.round_px(o['coin'], float(o['limitPx'])),
+                    self.round_sz(o['coin'], float(o['sz'])))
+
         # 2. 检测变化 (基于目标挂单的指纹集合)
-        current_target_keys = set(target_map.keys())
+        current_target_keys = set(target_key(o) for o in target_orders)
 
         # 防抖：目标挂单集合需连续两轮一致才执行同步，过滤 API 脏读导致的反复撤挂
         prev_raw = self._prev_target_order_keys
@@ -662,48 +672,68 @@ class HyperliquidCopier:
                 logger.info(f"挂单读数变化未确认 (本轮 {len(current_target_keys)} 笔)，等待下轮确认，本轮跳过")
             return
 
-        # 如果是第一次运行，或者 target_keys 发生了变化，则执行同步
+        # 如果目标挂单自上次同步以来没变，则无需处理
         if self.last_target_keys == current_target_keys:
             return
 
         if self.last_target_keys is not None:
-            self.send_imessage_notification(target_orders)
+            self.send_order_change_notification(target_orders)
 
-        logger.info(f"检测到挂单变化，开始全量同步... (目标挂单数: {len(target_orders)})")
+        # 3. 增量对比(按指纹多重集，正确处理重复挂单)：只撤我方多余的、只挂缺失的，已一致的保持不动
+        desired_by_key = {}
+        for o in target_orders:
+            desired_by_key.setdefault(desired_key(o), []).append(o)
+        my_by_key = {}
+        for o in my_orders:
+            my_by_key.setdefault(my_key(o), []).append(o)
 
-        # 3. 取消我账户中已有的所有挂单
-        if my_orders:
-            cancels = [{"coin": o['coin'], "oid": o['oid']} for o in my_orders]
-            logger.info(f"取消我账户所有挂单 ({len(cancels)} 个)")
+        to_cancel = []
+        to_create = []
+        for k in set(my_by_key) | set(desired_by_key):
+            mine = my_by_key.get(k, [])
+            want = desired_by_key.get(k, [])
+            if len(mine) > len(want):
+                to_cancel.extend(mine[len(want):])   # 多出来的撤掉
+            elif len(want) > len(mine):
+                to_create.extend(want[len(mine):])   # 缺失的补挂
+
+        if not to_cancel and not to_create:
+            logger.info(f"挂单已与目标一致 ({len(current_target_keys)} 笔)，无需调整")
+            self.last_target_keys = current_target_keys
+            return
+
+        logger.info(f"检测到挂单变化，增量同步: 撤 {len(to_cancel)} 笔 / 挂 {len(to_create)} 笔 "
+                    f"(目标 {len(target_orders)} 笔, 我方 {len(my_orders)} 笔)")
+
+        # 4. 撤掉我方多余挂单
+        if to_cancel:
+            cancels = [{"coin": o['coin'], "oid": o['oid']} for o in to_cancel]
             try:
                 res = self.exchange.bulk_cancel(cancels)
                 if res['status'] == 'ok':
-                    logger.info("撤单请求已发送")
+                    logger.info(f"已撤销多余挂单 ({len(cancels)} 个)")
                 else:
                     logger.error(f"撤单请求失败: {res}")
+                    self._alert_now("cancel_fail",
+                                    f"撤单请求失败，已放弃本轮挂单同步: {str(res)[:150]}")
                     return  # 撤单失败，放弃本次同步，防止保证金不足
 
                 # 撤单后稍微等待，让 margin 释放生效
                 time.sleep(0.5)
             except Exception as e:
                 logger.error(f"撤单异常: {e}")
+                self._alert_now("cancel_exc",
+                                f"撤单异常，已放弃本轮挂单同步: {e}")
                 return  # 撤单异常，放弃本次同步，防止保证金不足
 
-        # 4. 准备下单列表 (全部目标挂单)
-        to_create = list(target_orders)
-        
         if not to_create:
             self.last_target_keys = current_target_keys
             return
 
-        # 5. 排序: 从高价往低价 (Price DESC)
-        # key 结构: (coin, side, price)
-        # 这里直接用 target_order 对象排序
+        # 5. 补挂缺失的目标挂单: 从高价往低价 (Price DESC)，逐个下单直到保证金不足
         to_create.sort(key=lambda x: self.round_px(x['coin'], float(x['limitPx'])), reverse=True)
-        
-        # 6. 逐个下单直到保证金不足
-        logger.info(f"计划执行 {len(to_create)} 个挂单，按价格从高到低...")
-        
+        logger.info(f"计划补挂 {len(to_create)} 个挂单，按价格从高到低...")
+
         for target_order in to_create:
             coin = target_order['coin']
             side = target_order['side']
@@ -784,62 +814,80 @@ class HyperliquidCopier:
         if self.last_target_keys is not None:
             added_keys = current_target_keys - self.last_target_keys
             removed_keys = self.last_target_keys - current_target_keys
-            self.send_imessage_notification(target_orders, added_keys, removed_keys)
+            self.send_order_change_notification(target_orders, added_keys, removed_keys)
 
         self.last_target_keys = current_target_keys
 
-    def _notify_env(self):
-        """构造 openclaw 子进程的环境变量，确保 PATH 包含 node"""
-        env = os.environ.copy()
-        extra_paths = ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin",
-                       os.path.expanduser("~/.npm-global/bin")]
-        current_path = env.get("PATH", "")
-        for p in extra_paths:
-            if p not in current_path:
-                current_path = p + ":" + current_path
-        env["PATH"] = current_path
-        return env
-
-    def send_feishu_text(self, text):
-        """通过 OpenClaw 发送飞书通知"""
-        if not text: return
+    def _enqueue(self, message, label):
+        """把消息体(含 msg_type 的字典)投递到后台队列；队列满则丢最旧保最新。"""
+        item = (message, label)
         try:
-            cmd = [OPENCLAW_BIN, "message", "send",
-                   "--channel", "feishu",
-                   "--target", FEISHU_TARGET,
-                   "--message", text]
-            if OPENCLAW_DRY_RUN:
-                cmd.append("--dry-run")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=self._notify_env())
-            if result.returncode == 0:
-                logger.info(f"飞书通知已发送: {text[:30]}...")
-            else:
-                logger.error(f"飞书通知发送失败 (code {result.returncode}): {result.stderr.strip()}")
-        except subprocess.TimeoutExpired:
-            logger.error("飞书通知发送超时 (30s)")
-        except Exception as e:
-            logger.error(f"发送飞书通知失败: {e}")
+            self._notify_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._notify_queue.get_nowait()
+                self._notify_queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._notify_queue.put_nowait(item)
+            except queue.Full:
+                logger.warning("通知队列持续积压，丢弃一条通知")
 
-    def send_imessage_text(self, text):
-        """通过 OpenClaw 发送通知：同时推送 iMessage 和飞书"""
-        if not text: return
-        self.send_feishu_text(text)
-        try:
-            cmd = [OPENCLAW_BIN, "message", "send",
-                   "--channel", "imessage",
-                   "--target", IMESSAGE_TARGET,
-                   "--message", text]
-            if OPENCLAW_DRY_RUN:
-                cmd.append("--dry-run")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=self._notify_env())
-            if result.returncode == 0:
-                logger.info(f"iMessage通知已发送: {text[:30]}...")
-            else:
-                logger.error(f"iMessage通知发送失败 (code {result.returncode}): {result.stderr.strip()}")
-        except subprocess.TimeoutExpired:
-            logger.error("iMessage通知发送超时 (30s)")
-        except Exception as e:
-            logger.error(f"发送iMessage失败: {e}")
+    def send_notification(self, text):
+        """发送纯文本通知：仅入队，立即返回，绝不阻塞跟单主循环。"""
+        if not text:
+            return
+        self._enqueue({"msg_type": "text", "content": {"text": text}}, text[:30])
+
+    def send_card(self, card, label="卡片消息"):
+        """发送交互式卡片(如对比表)：仅入队，立即返回。"""
+        if not card:
+            return
+        self._enqueue({"msg_type": "interactive", "card": card}, label)
+
+    def _notify_worker(self):
+        """后台守护线程：串行取出通知并发送飞书 Webhook，与跟单主循环完全解耦。"""
+        while True:
+            message, label = self._notify_queue.get()
+            try:
+                self._send_feishu_webhook(message, label)
+            except Exception as e:
+                logger.error(f"通知发送线程异常: {e}")
+            finally:
+                self._notify_queue.task_done()
+
+    def _send_feishu_webhook(self, message, label=""):
+        """后台线程中实际发送飞书 Webhook；带熔断，连续失败则暂停一段时间。"""
+        if not message:
+            return
+        if not FEISHU_WEBHOOK_URL:
+            if not getattr(self, "_warned_no_webhook", False):
+                logger.warning("未配置 FEISHU_WEBHOOK_URL，跳过飞书通知（仅告警一次）")
+                self._warned_no_webhook = True
+            return
+        if time.time() < self._chan_skip_until.get("feishu", 0.0):
+            return  # 熔断冷却期内，直接跳过
+        ok, detail = feishu_post_sync(message)
+        if ok:
+            logger.info(f"飞书通知已发送: {label}...")
+            self._record_channel_result("feishu", True)
+        else:
+            logger.error(f"飞书通知发送失败: {detail}")
+            self._record_channel_result("feishu", False)
+
+    def _record_channel_result(self, channel, ok):
+        """记录通道成败：成功清零，连续失败达阈值则熔断暂停。"""
+        if ok:
+            self._chan_fail[channel] = 0
+            return
+        self._chan_fail[channel] = self._chan_fail.get(channel, 0) + 1
+        if self._chan_fail[channel] >= NOTIFY_FAIL_THRESHOLD:
+            self._chan_skip_until[channel] = time.time() + NOTIFY_SKIP_COOLDOWN
+            logger.warning(
+                f"通道[{channel}]连续失败{self._chan_fail[channel]}次，"
+                f"暂停{NOTIFY_SKIP_COOLDOWN}s不再尝试")
+            self._chan_fail[channel] = 0
 
     def write_notify_file(self, change_type, detail):
         """将变化写入通知文件，供 OpenClaw 读取"""
