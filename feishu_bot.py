@@ -163,14 +163,109 @@ def fetch_snapshot(address):
             "upnl": float(core.get("unrealizedPnl") or 0),
         }
     order_counts = {}
+    order_list = []
     for o in orders:
         order_counts[o["coin"]] = order_counts.get(o["coin"], 0) + 1
+        try:
+            order_list.append({
+                "coin": o["coin"],
+                "side": o.get("side", ""),  # 'B' 买 / 'A' 卖
+                "px": float(o.get("limitPx") or 0),
+                "sz": float(o.get("sz") or 0),
+            })
+        except Exception:
+            continue
     return {
         "acct_value": acct_value,
         "positions": positions,
         "order_counts": order_counts,
         "order_total": len(orders),
+        "orders": order_list,
     }
+
+
+# ---------------------------------------------------------------------------
+# 飞书原生卡片元素(markdown 段 / 原生 table 段)
+# ---------------------------------------------------------------------------
+def _md_el(text):
+    return {"tag": "markdown", "content": text}
+
+
+def _table_el(columns, rows, page_size=10):
+    """原生 table 组件：紧凑行高 + 灰底表头 + 百分比列宽，真正逐列控宽。"""
+    return {
+        "tag": "table",
+        "page_size": page_size,
+        "row_height": "low",
+        "header_style": {"background_style": "grey", "text_size": "normal",
+                         "bold": True, "lines": 1},
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def orders_table_el(tgt_orders, mine_orders):
+    """逐价位挂单明细对比(原生 table)。排序：卖单在上、买单在下，各自按价格降序；
+    目标有、我方缺的买单价位标 ⚠️(常见于因保证金不足舍弃的最低价买单)。无数据返回 None。"""
+    def grp(orders):
+        d = {}
+        for o in (orders or []):
+            key = (o["coin"], o["side"], round(o["px"], 8))
+            d[key] = d.get(key, 0.0) + o["sz"]
+        return d
+    tg = grp(tgt_orders)
+    mg = grp(mine_orders)
+    # 卖(A)在前、买(B)在后；同侧按价格降序
+    keys = sorted(set(tg) | set(mg),
+                  key=lambda k: (k[0], 0 if k[1] == 'A' else 1, -k[2]))
+    if not keys:
+        return None
+    columns = [
+        {"name": "coin", "display_name": "币种", "data_type": "text", "width": "16%", "horizontal_align": "left"},
+        {"name": "side", "display_name": "方向", "data_type": "text", "width": "12%", "horizontal_align": "center"},
+        {"name": "px", "display_name": "价格", "data_type": "text", "width": "26%", "horizontal_align": "right"},
+        {"name": "tgt", "display_name": "🎯目标", "data_type": "text", "width": "23%", "horizontal_align": "right"},
+        {"name": "mine", "display_name": "👤我方", "data_type": "text", "width": "23%", "horizontal_align": "right"},
+    ]
+    rows = []
+    for (coin, side, px) in keys:
+        sd = "买" if side == 'B' else ("卖" if side == 'A' else side)
+        t = tg.get((coin, side, px))
+        m = mg.get((coin, side, px))
+        tcell = _fmt_num(t) if t is not None else "—"
+        flag = " ⚠️" if (t is not None and m is None and side == 'B') else ""
+        mcell = (_fmt_num(m) if m is not None else "—") + flag
+        rows.append({"coin": coin, "side": sd, "px": _fmt_num(px, 2), "tgt": tcell, "mine": mcell})
+    return _table_el(columns, rows)
+
+
+def positions_table_el(tgt, mine):
+    """逐币种持仓对比(原生 table，目标/我方各一行)。无持仓返回 None。"""
+    coins = sorted(set(tgt['positions']) | set(mine['positions']))
+    if not coins:
+        return None
+    columns = [
+        {"name": "acct", "display_name": "账户", "data_type": "text", "width": "15%", "horizontal_align": "left"},
+        {"name": "coin", "display_name": "币种", "data_type": "text", "width": "12%", "horizontal_align": "left"},
+        {"name": "side", "display_name": "方向", "data_type": "text", "width": "10%", "horizontal_align": "center"},
+        {"name": "sz", "display_name": "数量", "data_type": "text", "width": "16%", "horizontal_align": "right"},
+        {"name": "entry", "display_name": "均价", "data_type": "text", "width": "16%", "horizontal_align": "right"},
+        {"name": "value", "display_name": "市值", "data_type": "text", "width": "16%", "horizontal_align": "right"},
+        {"name": "upnl", "display_name": "浮盈", "data_type": "text", "width": "15%", "horizontal_align": "right"},
+    ]
+    rows = []
+    for c in coins:
+        for tag, snap in (("🎯目标", tgt['positions'].get(c)),
+                          ("👤我方", mine['positions'].get(c))):
+            if not snap:
+                rows.append({"acct": tag, "coin": c, "side": "-", "sz": "-",
+                             "entry": "-", "value": "-", "upnl": "-"})
+                continue
+            side = "多" if snap['szi'] > 0 else "空"
+            rows.append({"acct": tag, "coin": c, "side": side,
+                         "sz": _fmt_num(abs(snap['szi'])), "entry": _fmt_num(snap['entry'], 2),
+                         "value": _fmt_usd(snap['value']), "upnl": f"{snap['upnl']:+,.2f}"})
+    return _table_el(columns, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -182,70 +277,36 @@ def _header_line():
 
 
 def md_comparison():
+    """账户对比：返回卡片元素列表(权益小表 markdown + 持仓/挂单原生 table)。"""
     tgt = fetch_snapshot(TARGET_ADDRESS)
     mine = fetch_snapshot(MY_ADDRESS)
     if tgt is None or mine is None:
         return None
-    md = [_header_line(), ""]
-    md.append("**💰 账户权益**")
-    md.append("| 账户 | 权益 |")
-    md.append("| :-- | --: |")
-    md.append(f"| 🎯目标 | {_fmt_usd(tgt['acct_value'])} |")
-    md.append(f"| 👤我方 | {_fmt_usd(mine['acct_value'])} |")
-    md.append("")
-    coins = sorted(set(tgt['positions']) | set(mine['positions']))
-    md.append("**📈 持仓对比**")
-    if not coins:
-        md.append("_两账户均无持仓_")
-    else:
-        md.append("| 账户 | 数量 | 均价 | 市值 | 浮盈 | 币种 | 方向 |")
-        md.append("| :-- | --: | --: | --: | --: | :-- | :-: |")
-        for c in coins:
-            for tag, snap in (("🎯", tgt['positions'].get(c)),
-                              ("👤", mine['positions'].get(c))):
-                if not snap:
-                    md.append(f"| {tag} | - | - | - | - | {c} | - |")
-                    continue
-                side = "多" if snap['szi'] > 0 else "空"
-                md.append(
-                    f"| {tag} | {_fmt_num(abs(snap['szi']))} | "
-                    f"{_fmt_num(snap['entry'], 2)} | {_fmt_usd(snap['value'])} | "
-                    f"{snap['upnl']:+,.2f} | {c} | {side} |")
-    md.append("")
-    ocoins = sorted(set(tgt['order_counts']) | set(mine['order_counts']))
-    md.append("**📋 挂单对比**")
-    md.append("| 币种 | 🎯目标 | 👤我方 |")
-    md.append("| :-- | --: | --: |")
-    for c in ocoins:
-        md.append(f"| {c} | {tgt['order_counts'].get(c, 0)} | {mine['order_counts'].get(c, 0)} |")
-    md.append(f"| **合计** | **{tgt['order_total']}** | **{mine['order_total']}** |")
-    return "\n".join(md)
+    els = [_md_el(_header_line())]
+    els.append(_md_el(
+        "**💰 账户权益**\n| 账户 | 权益 |\n| :-- | --: |\n"
+        f"| 🎯目标 | {_fmt_usd(tgt['acct_value'])} |\n"
+        f"| 👤我方 | {_fmt_usd(mine['acct_value'])} |"))
+    els.append(_md_el("**📈 持仓对比**"))
+    pt = positions_table_el(tgt, mine)
+    els.append(pt if pt else _md_el("_两账户均无持仓_"))
+    els.append(_md_el(
+        f"**📋 挂单明细对比**　(🎯{tgt['order_total']} 笔 vs 👤{mine['order_total']} 笔)"))
+    ot = orders_table_el(tgt.get('orders'), mine.get('orders'))
+    els.append(ot if ot else _md_el("_两账户均无挂单_"))
+    return els
 
 
 def md_positions():
+    """持仓明细：返回卡片元素列表(原生 table)。"""
     tgt = fetch_snapshot(TARGET_ADDRESS)
     mine = fetch_snapshot(MY_ADDRESS)
     if tgt is None or mine is None:
         return None
-    coins = sorted(set(tgt['positions']) | set(mine['positions']))
-    md = [_header_line(), "", "**📈 持仓明细**"]
-    if not coins:
-        md.append("_两账户均无持仓_")
-        return "\n".join(md)
-    md.append("| 账户 | 币种 | 方向 | 数量 | 均价 | 市值 | 浮盈 |")
-    md.append("| :-- | :-- | :-: | --: | --: | --: | --: |")
-    for c in coins:
-        for tag, snap in (("🎯目标", tgt['positions'].get(c)),
-                          ("👤我方", mine['positions'].get(c))):
-            if not snap:
-                md.append(f"| {tag} | {c} | - | - | - | - | - |")
-                continue
-            side = "多" if snap['szi'] > 0 else "空"
-            md.append(
-                f"| {tag} | {c} | {side} | {_fmt_num(abs(snap['szi']))} | "
-                f"{_fmt_num(snap['entry'], 2)} | {_fmt_usd(snap['value'])} | "
-                f"{snap['upnl']:+,.2f} |")
-    return "\n".join(md)
+    els = [_md_el(_header_line() + "\n\n**📈 持仓明细**")]
+    pt = positions_table_el(tgt, mine)
+    els.append(pt if pt else _md_el("_两账户均无持仓_"))
+    return els
 
 
 def md_balance():
@@ -265,21 +326,16 @@ def md_balance():
 
 
 def md_orders():
+    """挂单明细：返回卡片元素列表(原生 table)。"""
     tgt = fetch_snapshot(TARGET_ADDRESS)
     mine = fetch_snapshot(MY_ADDRESS)
     if tgt is None or mine is None:
         return None
-    ocoins = sorted(set(tgt['order_counts']) | set(mine['order_counts']))
-    md = [_header_line(), "", "**📋 挂单对比**"]
-    if not ocoins:
-        md.append("_两账户均无挂单_")
-        return "\n".join(md)
-    md.append("| 币种 | 🎯目标 | 👤我方 |")
-    md.append("| :-- | --: | --: |")
-    for c in ocoins:
-        md.append(f"| {c} | {tgt['order_counts'].get(c, 0)} | {mine['order_counts'].get(c, 0)} |")
-    md.append(f"| **合计** | **{tgt['order_total']}** | **{mine['order_total']}** |")
-    return "\n".join(md)
+    els = [_md_el(_header_line() + "\n\n"
+                  f"**📋 挂单明细对比**　(🎯{tgt['order_total']} 笔 vs 👤{mine['order_total']} 笔)")]
+    ot = orders_table_el(tgt.get('orders'), mine.get('orders'))
+    els.append(ot if ot else _md_el("_两账户均无挂单_"))
+    return els
 
 
 def md_pnl():
@@ -340,6 +396,21 @@ def md_status():
 # ---------------------------------------------------------------------------
 # 卡片构造
 # ---------------------------------------------------------------------------
+def elements_card(elements, header_title=None, template="blue"):
+    """用卡片元素列表(markdown 段 / 原生 table 段混排)构造交互式卡片。"""
+    card = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "body": {"elements": list(elements)},
+    }
+    if header_title:
+        card["header"] = {
+            "title": {"tag": "plain_text", "content": header_title},
+            "template": template,
+        }
+    return card
+
+
 def markdown_card(md_text, header_title=None, template="blue"):
     card = {
         "schema": "2.0",
@@ -479,11 +550,14 @@ def build_reply_card(cmd):
     if cmd == "帮助":
         return menu_card()
     title, fn = COMMANDS[cmd]
-    md = fn()
-    if md is None:
+    out = fn()
+    if out is None:
         return markdown_card("⚠️ 账户数据抓取失败，请稍后重试。", header_title=title, template="red")
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    return markdown_card(md + f"\n\n_更新于 {stamp}_", header_title=f"{title} · {stamp[11:]}")
+    # 生成函数可返回 markdown 字符串或卡片元素列表，统一成元素列表。
+    els = list(out) if isinstance(out, list) else [_md_el(out)]
+    els.append(_md_el(f"_更新于 {stamp}_"))
+    return elements_card(els, header_title=f"{title} · {stamp[11:]}")
 
 
 # ---------------------------------------------------------------------------

@@ -154,10 +154,16 @@ def feishu_send_sync(text, timeout=NOTIFY_SEND_TIMEOUT):
 
 def feishu_markdown_card(md_text, header_title=None, template="blue"):
     """用 markdown 文本构造一张交互式卡片(schema 2.0，markdown 组件支持竖线表格)。"""
+    return feishu_elements_card(
+        [{"tag": "markdown", "content": md_text}], header_title, template)
+
+
+def feishu_elements_card(elements, header_title=None, template="blue"):
+    """用卡片元素列表(markdown 段 / 原生 table 段混排)构造交互式卡片(schema 2.0)。"""
     card = {
         "schema": "2.0",
         "config": {"wide_screen_mode": True},
-        "body": {"elements": [{"tag": "markdown", "content": md_text}]},
+        "body": {"elements": list(elements)},
     }
     if header_title:
         card["header"] = {
@@ -330,6 +336,10 @@ class HyperliquidCopier:
         self._alerted = set()
         # 跟单层即时告警去重：key -> 上次发送时间戳，冷却期内同类不重复。
         self._alert_last = {}
+        # 最近一次因保证金不足而舍弃的最低价买单(供报告展示提示)。
+        # 元素: {"coin","side","px","sz"}；_last_discarded_ts 为发生时间。
+        self._last_discarded = []
+        self._last_discarded_ts = 0.0
 
         # 每天定时对比表：在 REPORT_HOURS 指定的整点各发一次两账户对比。
         self._report_thread = threading.Thread(
@@ -731,28 +741,35 @@ class HyperliquidCopier:
             return
 
         # 5. 补挂缺失的目标挂单: 从高价往低价 (Price DESC)，逐个下单直到保证金不足
+        #    一旦保证金不足即停止：由于按价格从高到低挂，剩余未挂的天然是"最低价"的那批，
+        #    即优先舍弃最低价买单(远离市价、最不易成交者)。被舍弃的挂单会记录并在报告中提示。
         to_create.sort(key=lambda x: self.round_px(x['coin'], float(x['limitPx'])), reverse=True)
         logger.info(f"计划补挂 {len(to_create)} 个挂单，按价格从高到低...")
 
-        for target_order in to_create:
+        # 本轮重新评估舍弃情况：若全部挂上则清空(报告不再显示旧提示)
+        self._last_discarded = []
+        self._last_discarded_ts = 0.0
+
+        for idx, target_order in enumerate(to_create):
             coin = target_order['coin']
             side = target_order['side']
             px = self.round_px(coin, float(target_order['limitPx']))
-            
+
             # 计算跟单数量
             target_sz = float(target_order['sz'])
             sz_to_place = self.round_sz(coin, target_sz * COPY_RATIO)
-            
+
             if sz_to_place == 0:
                 continue
 
             is_buy = (side == 'B')
-            
+            margin_hit = False
+
             try:
                 # 检查日志避免刷屏
                 logger.info(f"尝试挂单: {coin} {side} {sz_to_place} @ {px}")
                 res = self.exchange.order(coin, is_buy, sz_to_place, px, {"limit": {"tif": "Gtc"}})
-                
+
                 if res['status'] == 'ok':
                     status = res['response']['data']['statuses'][0]
                     if 'error' in status:
@@ -760,10 +777,7 @@ class HyperliquidCopier:
                         logger.error(f"挂单业务错误: {err_msg}")
                         # 检查是否为 margin 相关错误
                         if 'Margin' in err_msg or 'balance' in err_msg.lower():
-                            logger.warning("⚠️ 保证金不足，停止继续挂单")
-                            self._alert_now("margin",
-                                            f"保证金不足，挂单中止(部分目标挂单未能跟上): {err_msg[:120]}")
-                            break
+                            margin_hit = True
                         else:
                             self._alert_now(f"order_err_{coin}",
                                             f"{coin} 挂单业务错误: {err_msg[:120]}")
@@ -776,17 +790,52 @@ class HyperliquidCopier:
             except Exception as e:
                 logger.error(f"挂单异常: {e}")
                 if 'margin' in str(e).lower():
-                    logger.warning("⚠️ 捕获保证金异常，停止继续挂单")
-                    self._alert_now("margin", f"保证金不足(异常)，挂单中止: {e}")
-                    break
+                    margin_hit = True
                 else:
                     self._alert_now("order_exc", f"挂单异常: {e}")
-            
+
+            if margin_hit:
+                # 保证金不足：舍弃"当前这笔 + 剩余未挂的"(均为最低价一侧)，记录并告警后停止
+                logger.warning("⚠️ 保证金不足，舍弃剩余最低价挂单并停止本轮补挂")
+                self._record_margin_discard(to_create[idx:])
+                break
+
             # 稍微间隔一下避免速率限制
             time.sleep(0.1)
 
         # 更新状态指纹
         self.last_target_keys = current_target_keys
+
+    def _record_margin_discard(self, discarded_orders):
+        """记录因保证金不足被舍弃的挂单(最低价一侧)，存状态供报告提示，并发一条带明细的告警。"""
+        items = []
+        for o in discarded_orders:
+            coin = o['coin']
+            items.append({
+                "coin": coin,
+                "side": o['side'],  # 'B' 买 / 'A' 卖
+                "px": self.round_px(coin, float(o['limitPx'])),
+                "sz": self.round_sz(coin, float(o['sz']) * COPY_RATIO),
+            })
+        self._last_discarded = items
+        self._last_discarded_ts = time.time()
+
+        buys = [it for it in items if it['side'] == 'B']
+        sells = [it for it in items if it['side'] == 'A']
+
+        def _fmt_items(lst, n=6):
+            parts = [f"{it['coin']} {'买' if it['side']=='B' else '卖'}@{it['px']}×{it['sz']}"
+                     for it in lst[:n]]
+            if len(lst) > n:
+                parts.append(f"…等共{len(lst)}笔")
+            return "；".join(parts)
+
+        msg = f"⚠️ 保证金不足，已舍弃 {len(items)} 笔最低价挂单"
+        if buys:
+            msg += f"\n舍弃最低价买单 {len(buys)} 笔: {_fmt_items(buys)}"
+        if sells:
+            msg += f"\n舍弃卖单 {len(sells)} 笔: {_fmt_items(sells)}"
+        self._alert_now("margin", msg)
 
     def monitor_open_orders(self, target_state):
         target_orders = target_state.get('openOrders', [])
@@ -1190,10 +1239,21 @@ class HyperliquidCopier:
                 "upnl": float(core.get("unrealizedPnl") or 0),
             }
         order_counts = {}
+        order_list = []
         for o in orders:
             order_counts[o["coin"]] = order_counts.get(o["coin"], 0) + 1
+            try:
+                order_list.append({
+                    "coin": o["coin"],
+                    "side": o.get("side", ""),  # 'B' 买 / 'A' 卖
+                    "px": float(o.get("limitPx") or 0),
+                    "sz": float(o.get("sz") or 0),
+                })
+            except Exception:
+                continue
         return {"acct_value": acct_value, "positions": positions,
-                "order_counts": order_counts, "order_total": len(orders)}
+                "order_counts": order_counts, "order_total": len(orders),
+                "orders": order_list}
 
     @staticmethod
     def _fmt_usd(v):
@@ -1204,60 +1264,141 @@ class HyperliquidCopier:
         s = f"{v:.{nd}f}"
         return s.rstrip("0").rstrip(".") if "." in s else s
 
-    def build_account_comparison_md(self):
-        """构建两账户(目标 vs 我方)对比的 Markdown(含竖线表格)；抓取失败返回 None。"""
+    # ---- 飞书原生卡片元素(markdown 段 / 原生 table 段) ----
+    @staticmethod
+    def _md_el(text):
+        return {"tag": "markdown", "content": text}
+
+    @staticmethod
+    def _table_el(columns, rows, page_size=10):
+        """原生 table 组件：紧凑行高 + 灰底表头 + 百分比列宽，真正逐列控宽。"""
+        return {
+            "tag": "table",
+            "page_size": page_size,
+            "row_height": "low",
+            "header_style": {"background_style": "grey", "text_size": "normal",
+                             "bold": True, "lines": 1},
+            "columns": columns,
+            "rows": rows,
+        }
+
+    @staticmethod
+    def _orders_table_el(tgt_orders, mine_orders):
+        """逐价位挂单明细对比(原生 table)。排序：卖单在上、买单在下，各自按价格降序；
+        目标有、我方缺的买单价位标 ⚠️。无数据返回 None。"""
+        def grp(orders):
+            d = {}
+            for o in (orders or []):
+                key = (o["coin"], o["side"], round(o["px"], 8))
+                d[key] = d.get(key, 0.0) + o["sz"]
+            return d
+        tg = grp(tgt_orders)
+        mg = grp(mine_orders)
+        # 卖(A)在前、买(B)在后；同侧按价格降序
+        keys = sorted(set(tg) | set(mg),
+                      key=lambda k: (k[0], 0 if k[1] == 'A' else 1, -k[2]))
+        if not keys:
+            return None
+        _f = HyperliquidCopier._fmt_num
+        columns = [
+            {"name": "coin", "display_name": "币种", "data_type": "text", "width": "16%", "horizontal_align": "left"},
+            {"name": "side", "display_name": "方向", "data_type": "text", "width": "12%", "horizontal_align": "center"},
+            {"name": "px", "display_name": "价格", "data_type": "text", "width": "26%", "horizontal_align": "right"},
+            {"name": "tgt", "display_name": "🎯目标", "data_type": "text", "width": "23%", "horizontal_align": "right"},
+            {"name": "mine", "display_name": "👤我方", "data_type": "text", "width": "23%", "horizontal_align": "right"},
+        ]
+        rows = []
+        for (coin, side, px) in keys:
+            sd = "买" if side == 'B' else ("卖" if side == 'A' else side)
+            t = tg.get((coin, side, px))
+            m = mg.get((coin, side, px))
+            tcell = _f(t) if t is not None else "—"
+            flag = " ⚠️" if (t is not None and m is None and side == 'B') else ""
+            mcell = (_f(m) if m is not None else "—") + flag
+            rows.append({"coin": coin, "side": sd, "px": _f(px, 2), "tgt": tcell, "mine": mcell})
+        return HyperliquidCopier._table_el(columns, rows)
+
+    @staticmethod
+    def _positions_table_el(tgt, mine):
+        """逐币种持仓对比(原生 table，目标/我方各一行)。无持仓返回 None。"""
+        coins = sorted(set(tgt['positions']) | set(mine['positions']))
+        if not coins:
+            return None
+        _f = HyperliquidCopier._fmt_num
+        _u = HyperliquidCopier._fmt_usd
+        columns = [
+            {"name": "acct", "display_name": "账户", "data_type": "text", "width": "15%", "horizontal_align": "left"},
+            {"name": "coin", "display_name": "币种", "data_type": "text", "width": "12%", "horizontal_align": "left"},
+            {"name": "side", "display_name": "方向", "data_type": "text", "width": "10%", "horizontal_align": "center"},
+            {"name": "sz", "display_name": "数量", "data_type": "text", "width": "16%", "horizontal_align": "right"},
+            {"name": "entry", "display_name": "均价", "data_type": "text", "width": "16%", "horizontal_align": "right"},
+            {"name": "value", "display_name": "市值", "data_type": "text", "width": "16%", "horizontal_align": "right"},
+            {"name": "upnl", "display_name": "浮盈", "data_type": "text", "width": "15%", "horizontal_align": "right"},
+        ]
+        rows = []
+        for c in coins:
+            for tag, snap in (("🎯目标", tgt['positions'].get(c)),
+                              ("👤我方", mine['positions'].get(c))):
+                if not snap:
+                    rows.append({"acct": tag, "coin": c, "side": "-", "sz": "-",
+                                 "entry": "-", "value": "-", "upnl": "-"})
+                    continue
+                side = "多" if snap['szi'] > 0 else "空"
+                rows.append({"acct": tag, "coin": c, "side": side,
+                             "sz": _f(abs(snap['szi'])), "entry": _f(snap['entry'], 2),
+                             "value": _u(snap['value']), "upnl": f"{snap['upnl']:+,.2f}"})
+        return HyperliquidCopier._table_el(columns, rows)
+
+    def _discard_banner_md(self):
+        """若最近(6h内)因保证金不足舍弃过最低价挂单，返回提示横幅行；否则返回 []。"""
+        if not self._last_discarded or (time.time() - self._last_discarded_ts > 6 * 3600):
+            return []
+        items = self._last_discarded
+        buys = [it for it in items if it['side'] == 'B']
+        when = time.strftime('%m-%d %H:%M', time.localtime(self._last_discarded_ts))
+        parts = [f"{it['coin']}{'买' if it['side']=='B' else '卖'}@"
+                 f"{self._fmt_num(it['px'], 2)}×{self._fmt_num(it['sz'])}" for it in items[:8]]
+        more = f" …等共{len(items)}笔" if len(items) > 8 else ""
+        return [f"**⚠️ 保证金不足：已舍弃 {len(items)} 笔最低价挂单**"
+                f"（其中买单 {len(buys)} 笔，{when}）",
+                "；".join(parts) + more, ""]
+
+    def build_account_comparison_elements(self):
+        """构建两账户(目标 vs 我方)对比的卡片元素列表(markdown 段 + 原生 table)；抓取失败返回 None。"""
         tgt = self._fetch_report_snapshot(TARGET_ADDRESS)
         mine = self._fetch_report_snapshot(self.my_address)
         if tgt is None or mine is None:
             return None
-        ts = time.strftime("%Y-%m-%d %H:%M")
-        md = []
-        md.append(f"**🎯目标** `{TARGET_ADDRESS[:6]}...{TARGET_ADDRESS[-4:]}`　"
-                  f"**👤我方** `{self.my_address[:6]}...{self.my_address[-4:]}`")
-        md.append("")
-        # 账户权益
-        md.append("**💰 账户权益**")
-        md.append("| 账户 | 权益 |")
-        md.append("| :-- | --: |")
-        md.append(f"| 🎯目标 | {self._fmt_usd(tgt['acct_value'])} |")
-        md.append(f"| 👤我方 | {self._fmt_usd(mine['acct_value'])} |")
-        md.append("")
-        # 持仓
-        coins = sorted(set(tgt['positions']) | set(mine['positions']))
-        md.append("**📈 持仓对比**")
-        if not coins:
-            md.append("_两账户均无持仓_")
-        else:
-            md.append("| 账户 | 数量 | 均价 | 市值 | 浮盈 | 币种 | 方向 |")
-            md.append("| :-- | --: | --: | --: | --: | :-- | :-: |")
-            for c in coins:
-                for tag, snap in (("🎯", tgt['positions'].get(c)),
-                                  ("👤", mine['positions'].get(c))):
-                    if not snap:
-                        md.append(f"| {tag} | - | - | - | - | {c} | - |")
-                        continue
-                    side = "多" if snap['szi'] > 0 else "空"
-                    md.append(
-                        f"| {tag} | {self._fmt_num(abs(snap['szi']))} | "
-                        f"{self._fmt_num(snap['entry'], 2)} | {self._fmt_usd(snap['value'])} | "
-                        f"{snap['upnl']:+,.2f} | {c} | {side} |")
-        md.append("")
-        # 挂单
-        ocoins = sorted(set(tgt['order_counts']) | set(mine['order_counts']))
-        md.append("**📋 挂单对比**")
-        md.append("| 币种 | 🎯目标 | 👤我方 |")
-        md.append("| :-- | --: | --: |")
-        for c in ocoins:
-            md.append(f"| {c} | {tgt['order_counts'].get(c, 0)} | {mine['order_counts'].get(c, 0)} |")
-        md.append(f"| **合计** | **{tgt['order_total']}** | **{mine['order_total']}** |")
-        return "\n".join(md)
+        els = []
+        # 顶部地址/比例 + 保证金舍弃提示(若近期发生)
+        head = [f"**🎯目标** `{TARGET_ADDRESS[:6]}...{TARGET_ADDRESS[-4:]}`　"
+                f"**👤我方** `{self.my_address[:6]}...{self.my_address[-4:]}`　|　跟单比例 **{COPY_RATIO}**"]
+        banner = self._discard_banner_md()
+        if banner:
+            head += [""] + [ln for ln in banner if ln]
+        els.append(self._md_el("\n".join(head)))
+        # 账户权益(两行小表，保留 markdown)
+        els.append(self._md_el(
+            "**💰 账户权益**\n| 账户 | 权益 |\n| :-- | --: |\n"
+            f"| 🎯目标 | {self._fmt_usd(tgt['acct_value'])} |\n"
+            f"| 👤我方 | {self._fmt_usd(mine['acct_value'])} |"))
+        # 持仓对比(原生 table)
+        els.append(self._md_el("**📈 持仓对比**"))
+        pt = self._positions_table_el(tgt, mine)
+        els.append(pt if pt else self._md_el("_两账户均无持仓_"))
+        # 挂单明细对比(原生 table，逐价位对齐，展示双方所有挂单)
+        els.append(self._md_el(
+            f"**📋 挂单明细对比**　(🎯{tgt['order_total']} 笔 vs 👤{mine['order_total']} 笔)"))
+        ot = self._orders_table_el(tgt.get('orders'), mine.get('orders'))
+        els.append(ot if ot else self._md_el("_两账户均无挂单_"))
+        return els
 
     def send_account_comparison(self):
-        """生成并发送两账户对比表(交互式卡片 + Markdown 表格，走异步队列)。"""
-        md = self.build_account_comparison_md()
-        if md:
+        """生成并发送两账户对比表(交互式卡片 + 原生 table，走异步队列)。"""
+        els = self.build_account_comparison_elements()
+        if els:
             title = f"📊 账户对比 {time.strftime('%Y-%m-%d %H:%M')}"
-            self.send_card(feishu_markdown_card(md, header_title=title), label="账户对比表")
+            self.send_card(feishu_elements_card(els, header_title=title), label="账户对比表")
             logger.info("已发送两账户对比表")
         else:
             logger.warning("对比表生成失败(账户状态抓取失败)，本次跳过")
